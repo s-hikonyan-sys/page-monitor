@@ -166,9 +166,9 @@ def main():
         
         genai.configure(api_key=current_key)
         
-        # ★最新モデルに変更
+        # ★ご指摘の通り、正確な 3.0-flash に修正！
         model = genai.GenerativeModel(
-            model_name='gemini-3-flash', 
+            model_name='gemini-3.0-flash', 
             generation_config={"response_mime_type": "application/json"}
         )
 
