@@ -11,7 +11,7 @@ STATE_FILE = "seen_ids.txt"
 API_STATE_FILE = "api_state.json"
 
 def send_error_to_slack(webhook_url, error_message):
-    """エラー内容をSlackにのみ送信し、標準出力には出さない"""
+    """エラー内容をSlackにのみ送信し、標準出力には出さない（Publicログの汚染防止）"""
     if not webhook_url:
         return
         
@@ -72,7 +72,7 @@ def save_api_state(state):
 def get_current_api_key(keys_str, max_usage, reset_hour_utc):
     keys = [k.strip() for k in keys_str.split(",") if k.strip()]
     if not keys:
-        raise ValueError("GEMINI_API_KEYSが設定されていないか、空です。")
+        raise ValueError("GEMINI_API_KEYSが設定されていません。")
         
     state = load_api_state()
     
@@ -107,7 +107,7 @@ def main():
         RESET_HOUR_UTC = int(os.environ.get("RESET_HOUR_UTC", "0"))
 
         if not all([TARGET_URL, KEYS_STR, SLACK_WEBHOOK_URL, AI_PROMPT, PARSE_CONFIG]):
-            raise ValueError("必要な環境変数が不足しています。SecretsとVariablesの設定を確認してください。")
+            raise ValueError("必須の環境変数(Secrets/Variables)が不足しています。")
 
         config = json.loads(PARSE_CONFIG)
         seen_ids = load_seen_ids()
@@ -145,7 +145,7 @@ def main():
                                             "id": item_id,
                                             "title": title,
                                             "url": url,
-                                            "description": description[:100]
+                                            "description": description[:150]
                                         })
                 except Exception:
                     continue # ページ単位での読み込みエラーはスキップして次へ
@@ -154,7 +154,7 @@ def main():
         if not new_items:
             sys.exit(0)
 
-        # 初回実行時は記録だけしてAI判定をスキップする
+        # 初回実行時（ファイルが空）はID記録のみ行い、AIリクエストをスキップ
         if len(seen_ids) == 0:
             for item in new_items:
                 seen_ids.add(item["id"])
@@ -165,8 +165,10 @@ def main():
         current_key, api_state = get_current_api_key(KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC)
         
         genai.configure(api_key=current_key)
+        
+        # ★最新モデルに変更
         model = genai.GenerativeModel(
-            model_name='gemini-3.1-flash', # ★最新の 3.1-flash に修正済
+            model_name='gemini-3-flash', 
             generation_config={"response_mime_type": "application/json"}
         )
 
@@ -192,14 +194,14 @@ def main():
                 "type": "header",
                 "text": {
                     "type": "plain_text",
-                    "text": "🎯 新規の検証対象を発見しました"
+                    "text": "🎯 呪い解除に適合する新規タスクを発見しました"
                 }
             }
         ]
 
         for job in result_json:
             score = job.get("score", 0)
-            if score >= 90: # ★プロンプトに合わせて90点以上に変更
+            if score >= 90:
                 blocks.append({
                     "type": "section",
                     "text": {
@@ -210,8 +212,7 @@ def main():
                 blocks.append({"type": "divider"})
 
         if len(blocks) > 1:
-            slack_payload = {"blocks": blocks}
-            requests.post(SLACK_WEBHOOK_URL, json=slack_payload, timeout=10)
+            requests.post(SLACK_WEBHOOK_URL, json={"blocks": blocks}, timeout=10)
 
     except Exception as e:
         # トレースバックの全貌を取得してSlackに投げる
