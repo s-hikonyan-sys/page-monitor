@@ -166,7 +166,7 @@ def main():
         
         genai.configure(api_key=current_key)
         model = genai.GenerativeModel(
-            model_name='gemini-1.5-flash',
+            model_name='gemini-3.1-flash', # ★最新の 3.1-flash に修正済
             generation_config={"response_mime_type": "application/json"}
         )
 
@@ -199,12 +199,12 @@ def main():
 
         for job in result_json:
             score = job.get("score", 0)
-            if score >= 80:
+            if score >= 90: # ★プロンプトに合わせて90点以上に変更
                 blocks.append({
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"*{job.get('title', 'タイトルなし')}*\n*URL:* {job.get('url', '#')}\n*安全度:* {score}点\n*AI推奨理由:* {job.get('reason', '記載なし')}"
+                        "text": f"*{job.get('title', 'タイトルなし')}*\n*URL:* {job.get('url', '#')}\n*安全度:* {score}点\n\n*推奨理由と提案文:*\n{job.get('reason', '記載なし')}"
                     }
                 })
                 blocks.append({"type": "divider"})
