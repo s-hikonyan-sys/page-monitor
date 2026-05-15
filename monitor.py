@@ -5,7 +5,8 @@ import requests
 import datetime
 import traceback
 from playwright.sync_api import sync_playwright
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 STATE_FILE = "seen_ids.txt"
 API_STATE_FILE = "api_state.json"
@@ -164,16 +165,16 @@ def main():
         # 2. キーローテーション & Gemini API 判定処理
         current_key, api_state = get_current_api_key(KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC)
         
-        genai.configure(api_key=current_key)
-        
-        # ★ご指摘の通り、正確な 3.0-flash に修正！
-        model = genai.GenerativeModel(
-            model_name='gemini-3.0-flash', 
-            generation_config={"response_mime_type": "application/json"}
-        )
+        client = genai.Client(api_key=current_key)
 
         prompt_text = f"{AI_PROMPT}\n\n【対象データ】\n{json.dumps(new_items, ensure_ascii=False)}"
-        response = model.generate_content(prompt_text)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt_text,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            ),
+        )
         
         # API利用回数をカウントアップ
         api_state["usage_count"] += 1
