@@ -23,7 +23,7 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install -r requirements.txt
+          pip install .
           playwright install chromium --with-deps
 
       - name: Run Page Monitor

@@ -179,3 +179,22 @@ def main():
 
 if __name__ == "__main__":
     main()
+[project]
+name = "page-monitor"
+version = "0.1.0"
+description = "Automated page monitoring and AI screening pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright==1.42.0",
+    "google-generativeai==0.4.1",
+    "requests==2.31.0"
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+# 今後ローカルでRuffやBlack等のLinter/Formatterを使う場合の設定予約スペース
+[tool.ruff]
+line-length = 120
