@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Automated page monitoring and AI screening pipeline"
 requires-python = ">=3.11"
 dependencies = [
-    "playwright==1.42.0",
+    "playwright==1.44.0",
     "google-generativeai==0.4.1",
     "requests==2.31.0"
 ]
