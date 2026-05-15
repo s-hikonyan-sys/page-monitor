@@ -1,0 +1,46 @@
+name: General Page UI Monitor
+
+on:
+  schedule:
+    - cron: '0 10 * * *'
+  workflow_dispatch:
+
+jobs:
+  check-and-notify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Run Page Monitor
+        env:
+          TARGET_URL: ${{ secrets.TARGET_URL }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          AI_PROMPT: ${{ secrets.AI_PROMPT }}
+          PARSE_CONFIG: ${{ secrets.PARSE_CONFIG }}
+          MAX_PAGES: ${{ vars.MAX_PAGES }}
+          MAX_API_USAGE: ${{ vars.MAX_API_USAGE }}
+          RESET_HOUR_UTC: ${{ vars.RESET_HOUR_UTC }}
+        run: python monitor.py
+
+      - name: Commit and Push State
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add seen_ids.txt api_state.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: update state files" && git push)
