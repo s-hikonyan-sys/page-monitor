@@ -26,13 +26,26 @@ jobs:
           pip install .
           python -m playwright install chromium --with-deps
 
-      - name: Run Page Monitor
+      - name: Run Pipeline
         env:
           TARGET_URL: ${{ secrets.TARGET_URL }}
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           AI_PROMPT: ${{ secrets.AI_PROMPT }}
           PARSE_CONFIG: ${{ secrets.PARSE_CONFIG }}
+          DETAIL_CONFIG: ${{ secrets.DETAIL_CONFIG }}
+          PROMPT_PHASE2: ${{ secrets.PROMPT_PHASE2 }}
+          PROMPT_PHASE4: ${{ secrets.PROMPT_PHASE4 }}
+          PROMPT_PHASE5: ${{ secrets.PROMPT_PHASE5 }}
+          PHASE2_FIELDS: ${{ secrets.PHASE2_FIELDS }}
+          PHASE4_FIELDS: ${{ secrets.PHASE4_FIELDS }}
+          PHASE5_FIELDS: ${{ secrets.PHASE5_FIELDS }}
+          PHASE2_PASS_FIELD: ${{ secrets.PHASE2_PASS_FIELD }}
+          PHASE4_PASS_FIELD: ${{ secrets.PHASE4_PASS_FIELD }}
+          NOTIFY_HEADER: ${{ secrets.NOTIFY_HEADER }}
+          NOTIFY_FIELDS: ${{ secrets.NOTIFY_FIELDS }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          PASS_THRESHOLD: ${{ vars.PASS_THRESHOLD }}
           MAX_PAGES: ${{ vars.MAX_PAGES }}
           MAX_API_USAGE: ${{ vars.MAX_API_USAGE }}
           RESET_HOUR_UTC: ${{ vars.RESET_HOUR_UTC }}

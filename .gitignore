@@ -1,0 +1,3 @@
+# プロンプト・機密設定（GitHub Secrets へ手動コピーするローカル用）
+private/
+__pycache__
