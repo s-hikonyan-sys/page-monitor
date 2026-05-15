@@ -3,11 +3,47 @@ import sys
 import json
 import requests
 import datetime
+import traceback
 from playwright.sync_api import sync_playwright
 import google.generativeai as genai
 
 STATE_FILE = "seen_ids.txt"
 API_STATE_FILE = "api_state.json"
+
+def send_error_to_slack(webhook_url, error_message):
+    """エラー内容をSlackにのみ送信し、標準出力には出さない"""
+    if not webhook_url:
+        return
+        
+    # Slackのフォーマット崩れを防ぐためバッククォートを置換
+    safe_error = error_message.replace("```", "'''")
+    
+    # エラーログが長すぎる場合、一番重要な「末尾（原因部分）」を残すようにスライス
+    if len(safe_error) > 2800:
+        safe_error = "...\n" + safe_error[-2800:]
+
+    payload = {
+        "blocks": [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "🚨 Page Monitor 実行エラー"
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"実行中にエラーが発生しました。\n```\n{safe_error}\n```"
+                }
+            }
+        ]
+    }
+    try:
+        requests.post(webhook_url, json=payload, timeout=10)
+    except Exception:
+        pass
 
 def secure_exit():
     sys.exit(1)
@@ -36,7 +72,7 @@ def save_api_state(state):
 def get_current_api_key(keys_str, max_usage, reset_hour_utc):
     keys = [k.strip() for k in keys_str.split(",") if k.strip()]
     if not keys:
-        secure_exit()
+        raise ValueError("GEMINI_API_KEYSが設定されていないか、空です。")
         
     state = load_api_state()
     
@@ -59,10 +95,10 @@ def get_current_api_key(keys_str, max_usage, reset_hour_utc):
     return keys[state["current_index"]], state
 
 def main():
+    SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
     try:
         TARGET_URL = os.environ.get("TARGET_URL")
         KEYS_STR = os.environ.get("GEMINI_API_KEYS")
-        SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
         AI_PROMPT = os.environ.get("AI_PROMPT")
         PARSE_CONFIG = os.environ.get("PARSE_CONFIG")
         
@@ -71,13 +107,9 @@ def main():
         RESET_HOUR_UTC = int(os.environ.get("RESET_HOUR_UTC", "0"))
 
         if not all([TARGET_URL, KEYS_STR, SLACK_WEBHOOK_URL, AI_PROMPT, PARSE_CONFIG]):
-            secure_exit()
+            raise ValueError("必要な環境変数が不足しています。SecretsとVariablesの設定を確認してください。")
 
-        try:
-            config = json.loads(PARSE_CONFIG)
-        except Exception:
-            secure_exit()
-
+        config = json.loads(PARSE_CONFIG)
         seen_ids = load_seen_ids()
         new_items = []
 
@@ -116,13 +148,13 @@ def main():
                                             "description": description[:100]
                                         })
                 except Exception:
-                    continue # ページ読み込み失敗時はスキップして次ページへ
+                    continue # ページ単位での読み込みエラーはスキップして次へ
             browser.close()
 
         if not new_items:
             sys.exit(0)
 
-        # ★初回実行時（ファイルに何も記録がない状態）は記録だけしてAI判定をスキップする
+        # 初回実行時は記録だけしてAI判定をスキップする
         if len(seen_ids) == 0:
             for item in new_items:
                 seen_ids.add(item["id"])
@@ -181,7 +213,10 @@ def main():
             slack_payload = {"blocks": blocks}
             requests.post(SLACK_WEBHOOK_URL, json=slack_payload, timeout=10)
 
-    except Exception:
+    except Exception as e:
+        # トレースバックの全貌を取得してSlackに投げる
+        error_msg = traceback.format_exc()
+        send_error_to_slack(SLACK_WEBHOOK_URL, error_msg)
         secure_exit()
 
 if __name__ == "__main__":

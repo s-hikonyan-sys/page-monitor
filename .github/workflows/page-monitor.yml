@@ -7,7 +7,7 @@ on:
 
 jobs:
   check-and-notify:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-22.04 # OS起因のインストールエラー回避のため固定
     permissions:
       contents: write
 
