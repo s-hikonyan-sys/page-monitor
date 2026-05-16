@@ -58,8 +58,6 @@ jobs:
           MAX_PAGES: ${{ vars.MAX_PAGES }}
           MAX_API_USAGE: ${{ vars.MAX_API_USAGE }}
           RESET_HOUR_UTC: ${{ vars.RESET_HOUR_UTC }}
-          GEMINI_BATCH_SIZE: ${{ vars.GEMINI_BATCH_SIZE }}
-          GEMINI_BATCH_INTERVAL_SEC: ${{ vars.GEMINI_BATCH_INTERVAL_SEC }}
           GEMINI_429_RETRY_SEC: ${{ vars.GEMINI_429_RETRY_SEC }}
         run: python monitor.py
 

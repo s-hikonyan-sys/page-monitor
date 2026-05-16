@@ -360,83 +360,13 @@ def call_gemini(keys_str, max_usage, reset_hour_utc, prompt_text, model_name):
     raise RuntimeError("Gemini API call failed")
 
 
-def _chunk_list(items, batch_size):
-    size = max(1, int(batch_size))
-    for start in range(0, len(items), size):
-        yield items[start:start + size]
-
-
-def call_gemini_in_batches(
-    keys_str,
-    max_usage,
-    reset_hour_utc,
-    base_prompt,
-    phase_prompt,
-    items,
-    model_name,
-    phase_tag,
-    required_fields,
-    pass_field=None,
-    batch_size=20,
-    batch_interval_sec=60,
-):
-    """Split items into batches, call the model per batch, merge JSON array results."""
-    if not items:
-        return [], 0
-
-    all_results = []
-    api_calls = 0
-    batches = list(_chunk_list(items, batch_size))
-    total_batches = len(batches)
-
-    for batch_index, batch in enumerate(batches):
-        if batch_index > 0 and batch_interval_sec > 0:
-            time.sleep(batch_interval_sec)
-
-        raw = call_gemini(
-            keys_str,
-            max_usage,
-            reset_hour_utc,
-            build_phase_prompt(base_prompt, phase_prompt, batch),
-            model_name,
-        )
-        api_calls += 1
-        batch_result = validate_json_list(
-            raw,
-            required_fields,
-            phase_tag,
-            pass_field=pass_field,
-            expected_count=len(batch),
-        )
-        input_ids = {str(x["id"]) for x in batch if x.get("id") is not None}
-        output_ids = {
-            str(x["id"]) for x in batch_result if x.get("id") is not None
-        }
-        if input_ids != output_ids:
-            missing = sorted(input_ids - output_ids)[:10]
-            extra = sorted(output_ids - input_ids)[:10]
-            raise ValueError(
-                f"[{phase_tag}] batch {batch_index + 1}/{total_batches} "
-                f"id mismatch: missing={missing} extra={extra}"
-            )
-        all_results.extend(batch_result)
-
-    return all_results, api_calls
-
-
-def validate_json_list(
-    text, required_fields, phase_tag, pass_field=None, expected_count=None,
-):
+def validate_json_list(text, required_fields, phase_tag, pass_field=None):
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
         raise ValueError(f"[{phase_tag}] JSON parse error: {e}\n{text[:500]}")
     if not isinstance(data, list):
         raise ValueError(f"[{phase_tag}] Response is not a JSON array: {type(data).__name__}")
-    if expected_count is not None and len(data) != expected_count:
-        raise ValueError(
-            f"[{phase_tag}] Expected {expected_count} items, got {len(data)}"
-        )
     for i, item in enumerate(data):
         if not isinstance(item, dict):
             raise ValueError(f"[{phase_tag}] Item [{i}] is not an object")
@@ -1134,10 +1064,6 @@ def main():
         MAX_API_USAGE = int(os.environ.get("MAX_API_USAGE", "1000"))
         RESET_HOUR_UTC = int(os.environ.get("RESET_HOUR_UTC", "0"))
         NOTIFY_SUMMARY_SAMPLE_MAX = int(os.environ.get("NOTIFY_SUMMARY_SAMPLE_MAX", "5"))
-        GEMINI_BATCH_SIZE = int(os.environ.get("GEMINI_BATCH_SIZE", "20"))
-        GEMINI_BATCH_INTERVAL_SEC = int(
-            os.environ.get("GEMINI_BATCH_INTERVAL_SEC", "60"),
-        )
         gemini_calls = 0
         seen_ids = load_seen_ids()
         seen_ids_before = len(seen_ids)
@@ -1224,21 +1150,15 @@ def main():
         if PROMPT_PHASE2:
             current_phase = "phase2"
             phase2_fields = [f.strip() for f in PHASE2_FIELDS.split(",") if f.strip()]
-            result2, phase2_calls = call_gemini_in_batches(
-                KEYS_STR,
-                MAX_API_USAGE,
-                RESET_HOUR_UTC,
-                AI_PROMPT,
-                PROMPT_PHASE2,
-                new_items,
+            raw = call_gemini(
+                KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
+                build_phase_prompt(AI_PROMPT, PROMPT_PHASE2, new_items),
                 GEMINI_MODEL,
-                current_phase,
-                phase2_fields,
-                pass_field=PHASE2_PASS_FIELD,
-                batch_size=GEMINI_BATCH_SIZE,
-                batch_interval_sec=GEMINI_BATCH_INTERVAL_SEC,
             )
-            gemini_calls += phase2_calls
+            gemini_calls += 1
+            result2 = validate_json_list(
+                raw, phase2_fields, current_phase, pass_field=PHASE2_PASS_FIELD,
+            )
             partial_result = result2
             passed2 = filter_passed(result2, PHASE2_PASS_FIELD)
             if not passed2:
@@ -1295,21 +1215,15 @@ def main():
 
             current_phase = "phase4"
             phase4_fields = [f.strip() for f in PHASE4_FIELDS.split(",") if f.strip()]
-            result4, phase4_calls = call_gemini_in_batches(
-                KEYS_STR,
-                MAX_API_USAGE,
-                RESET_HOUR_UTC,
-                AI_PROMPT,
-                PROMPT_PHASE4,
-                detailed_items,
+            raw = call_gemini(
+                KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
+                build_phase_prompt(AI_PROMPT, PROMPT_PHASE4, detailed_items),
                 GEMINI_MODEL,
-                current_phase,
-                phase4_fields,
-                pass_field=PHASE4_PASS_FIELD,
-                batch_size=GEMINI_BATCH_SIZE,
-                batch_interval_sec=GEMINI_BATCH_INTERVAL_SEC,
             )
-            gemini_calls += phase4_calls
+            gemini_calls += 1
+            result4 = validate_json_list(
+                raw, phase4_fields, current_phase, pass_field=PHASE4_PASS_FIELD,
+            )
             partial_result = result4
             result4_merged = merge_items_by_id(detailed_items, result4)
             passed4 = filter_passed(result4_merged, PHASE4_PASS_FIELD)
@@ -1352,20 +1266,13 @@ def main():
             current_phase = "phase5"
             phase5_fields = [f.strip() for f in PHASE5_FIELDS.split(",") if f.strip()]
             phase5_input = passed4
-            result5, phase5_calls = call_gemini_in_batches(
-                KEYS_STR,
-                MAX_API_USAGE,
-                RESET_HOUR_UTC,
-                AI_PROMPT,
-                PROMPT_PHASE5,
-                phase5_input,
+            raw = call_gemini(
+                KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
+                build_phase_prompt(AI_PROMPT, PROMPT_PHASE5, phase5_input),
                 GEMINI_MODEL,
-                current_phase,
-                phase5_fields,
-                batch_size=GEMINI_BATCH_SIZE,
-                batch_interval_sec=GEMINI_BATCH_INTERVAL_SEC,
             )
-            gemini_calls += phase5_calls
+            gemini_calls += 1
+            result5 = validate_json_list(raw, phase5_fields, current_phase)
             result5 = merge_items_by_id(phase5_input, result5)
             partial_result = result5
         else:
