@@ -2,7 +2,9 @@ name: General Page UI Monitor
 
 on:
   schedule:
-    - cron: '0 10 * * *' # 毎日 UTC10時 (JST19時)
+    - cron: '0 1 * * *'  # 毎日 JST 10:00 (UTC 01:00)
+    - cron: '0 5 * * *'  # 毎日 JST 14:00 (UTC 05:00)
+    - cron: '0 9 * * *'  # 毎日 JST 18:00 (UTC 09:00)
   workflow_dispatch:
 
 jobs:
