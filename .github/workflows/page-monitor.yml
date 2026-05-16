@@ -43,6 +43,8 @@ jobs:
           PHASE2_PASS_FIELD: ${{ secrets.PHASE2_PASS_FIELD }}
           PHASE4_PASS_FIELD: ${{ secrets.PHASE4_PASS_FIELD }}
           NOTIFY_HEADER: ${{ secrets.NOTIFY_HEADER }}
+          NOTIFY_NO_NEW_HEADER: ${{ secrets.NOTIFY_NO_NEW_HEADER }}
+          NOTIFY_SEED_HEADER: ${{ secrets.NOTIFY_SEED_HEADER }}
           NOTIFY_FIELDS: ${{ secrets.NOTIFY_FIELDS }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           PASS_THRESHOLD: ${{ vars.PASS_THRESHOLD }}

@@ -1,9 +1,11 @@
 import os
+import re
 import sys
 import json
 import requests
 import datetime
 import traceback
+from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 from google import genai
 from google.genai import types
@@ -42,6 +44,22 @@ def send_error_to_slack(webhook_url, error_message, current_phase=None, partial_
             "type": "section",
             "text": {"type": "mrkdwn", "text": f"Partial result:\n```\n{safe_partial}\n```"},
         })
+    try:
+        requests.post(webhook_url, json={"blocks": blocks}, timeout=10)
+    except Exception:
+        pass
+
+
+def send_info_to_slack(webhook_url, header, body):
+    if not webhook_url:
+        return
+    safe_body = body.replace("```", "'''")
+    if len(safe_body) > 2500:
+        safe_body = safe_body[:2500] + "...(truncated)"
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": header[:150]}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": safe_body}},
+    ]
     try:
         requests.post(webhook_url, json={"blocks": blocks}, timeout=10)
     except Exception:
@@ -151,45 +169,302 @@ def build_phase_prompt(base_prompt, phase_prompt, data):
     return f"{base_prompt}\n\n{phase_prompt}\n\n{json.dumps(data, ensure_ascii=False)}"
 
 
+def _ld_type_matches(node, expected_type):
+    if not expected_type or not isinstance(node, dict):
+        return False
+    raw = node.get("@type")
+    if raw is None:
+        return False
+    types = raw if isinstance(raw, list) else [raw]
+    short = expected_type.split("/")[-1]
+    for typ in types:
+        if not isinstance(typ, str):
+            continue
+        if typ == expected_type or typ == short or typ.endswith("/" + short):
+            return True
+    return False
+
+
+def _iter_ld_nodes(data):
+    if isinstance(data, list):
+        for entry in data:
+            yield from _iter_ld_nodes(entry)
+    elif isinstance(data, dict):
+        graph = data.get("@graph")
+        if graph is not None:
+            yield from _iter_ld_nodes(graph)
+        yield data
+
+
+def _collect_ld_types(data, found):
+    for node in _iter_ld_nodes(data):
+        raw = node.get("@type")
+        if raw is None:
+            continue
+        for typ in (raw if isinstance(raw, list) else [raw]):
+            if isinstance(typ, str) and typ not in found:
+                found.append(typ)
+
+
+def _normalize_url(url, base_url):
+    if isinstance(url, dict):
+        url = url.get("url") or url.get("@id")
+    if not url or not isinstance(url, str):
+        return None
+    url = url.strip()
+    if url.startswith("/"):
+        return urljoin(base_url, url)
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    return urljoin(base_url, url)
+
+
+def _item_id_from_url(url, config):
+    if not url:
+        return None
+    id_regex = config.get("id_regex")
+    if id_regex:
+        match = re.search(id_regex, url)
+        if match:
+            return match.group(1)
+    tail = url.rstrip("/").split("/")[-1]
+    return tail if tail.isdigit() else tail or None
+
+
+def _listing_record(item_id, title, url, description=""):
+    return {
+        "id": str(item_id),
+        "title": (title or "").strip() or f"item-{item_id}",
+        "url": url,
+        "description": (description or "")[:150],
+    }
+
+
+def _extract_ld_items(data, config, base_url, diagnostics):
+    root_type = config.get("root_type", "")
+    entity_key = config.get("entity", "")
+    list_key = config.get("list")
+    item_key = config.get("item", "item")
+    title_key = config.get("title", "name")
+    url_key = config.get("url", "url")
+    desc_key = config.get("desc", "description")
+    items = []
+
+    for node in _iter_ld_nodes(data):
+        if not _ld_type_matches(node, root_type):
+            continue
+        if entity_key not in node:
+            continue
+        diagnostics["itemlist_matched"] = True
+        entity_val = node[entity_key]
+        if isinstance(entity_val, list):
+            elements = entity_val
+        elif isinstance(entity_val, dict) and list_key:
+            inner = entity_val.get(list_key, [])
+            elements = inner if isinstance(inner, list) else []
+        else:
+            elements = []
+
+        for el in elements:
+            if not isinstance(el, dict):
+                continue
+            nested = el.get(item_key) if item_key else None
+            item_obj = nested if isinstance(nested, dict) else el
+            title = item_obj.get(title_key)
+            url = _normalize_url(item_obj.get(url_key), base_url)
+            description = item_obj.get(desc_key, "")
+            if not url:
+                continue
+            item_id = _item_id_from_url(url, config)
+            if not item_id:
+                continue
+            items.append(_listing_record(item_id, title, url, description))
+    return items
+
+
+def _extract_dom_items(page, config, base_url, diagnostics):
+    dom = config.get("dom") or {}
+    link_selector = dom.get("link_selector")
+    if not link_selector:
+        return []
+
+    id_regex = dom.get("id_regex", "")
+    title_min = int(dom.get("title_min_length", 1))
+    desc_max = int(dom.get("desc_max_length", 150))
+    items = []
+    seen_hrefs = set()
+
+    try:
+        links = page.locator(link_selector).all()
+    except Exception as e:
+        diagnostics["errors"].append(f"DOM link_selector failed: {e}")
+        return []
+
+    diagnostics["dom_link_count"] += len(links)
+
+    for link in links:
+        try:
+            href = link.get_attribute("href") or ""
+        except Exception:
+            continue
+        if not href or href in seen_hrefs:
+            continue
+        seen_hrefs.add(href)
+        url = _normalize_url(href, base_url)
+        if not url:
+            continue
+        item_id = _item_id_from_url(url, dom if dom.get("id_regex") else config)
+        if not item_id:
+            continue
+        try:
+            title = (link.inner_text() or "").strip()
+        except Exception:
+            title = ""
+        if len(title) < title_min:
+            title = f"item-{item_id}"
+        items.append(_listing_record(item_id, title, url, title[:desc_max]))
+    return items
+
+
+def _dedupe_items(items):
+    by_id = {}
+    for item in items:
+        by_id[item["id"]] = item
+    return list(by_id.values())
+
+
+def _empty_phase1_diagnostics(seen_ids):
+    return {
+        "pages_attempted": 0,
+        "ld_json_script_count": 0,
+        "ld_json_types": [],
+        "itemlist_matched": False,
+        "ld_items_count": 0,
+        "dom_link_count": 0,
+        "dom_items_count": 0,
+        "scraped_total": 0,
+        "new_count": 0,
+        "seen_ids_count": len(seen_ids),
+        "errors": [],
+        "sources": [],
+    }
+
+
+def format_phase1_scrape_failure(diag):
+    types = ", ".join(diag["ld_json_types"]) if diag["ld_json_types"] else "none"
+    lines = [
+        "Phase1: listing scrape returned 0 items",
+        "",
+        f"Pages tried: {diag['pages_attempted']}",
+        f"LD+JSON scripts: {diag['ld_json_script_count']} (types: {types})",
+        f"Target list type matched: {'yes' if diag['itemlist_matched'] else 'no'}",
+        f"LD items extracted: {diag['ld_items_count']}",
+        f"DOM links seen: {diag['dom_link_count']}",
+        f"DOM items extracted: {diag['dom_items_count']}",
+        f"Parse sources used: {', '.join(diag['sources']) or 'none'}",
+        f"Seen IDs loaded: {diag['seen_ids_count']}",
+    ]
+    if diag["errors"]:
+        lines.append("")
+        lines.append("Errors:")
+        for err in diag["errors"][:12]:
+            lines.append(f"- {err}")
+    lines.extend([
+        "",
+        "Likely cause: page structure changed, parse config mismatch, or load timeout.",
+        "Check PARSE_CONFIG (LD+JSON keys and optional dom block).",
+    ])
+    return "\n".join(lines)
+
+
+def format_phase1_no_new(diag):
+    return "\n".join([
+        "Phase1: scrape OK, no new items",
+        "",
+        f"Scraped: {diag['scraped_total']} items (all already in seen_ids)",
+        f"Seen IDs: {diag['seen_ids_count']}",
+        f"Sources: {', '.join(diag['sources']) or 'n/a'}",
+    ])
+
+
+def format_phase1_seed(diag, seeded_count):
+    return "\n".join([
+        "Phase1: initial seed completed",
+        "",
+        f"Stored {seeded_count} IDs in seen_ids (first run).",
+        f"Scraped: {diag['scraped_total']} items",
+        f"Sources: {', '.join(diag['sources']) or 'n/a'}",
+    ])
+
+
 def scrape_listing(page, config, seen_ids, max_pages, target_url):
-    new_items = []
+    diagnostics = _empty_phase1_diagnostics(seen_ids)
+    scraped_all = []
+    dom_cfg = config.get("dom") or {}
+    use_dom = bool(dom_cfg.get("link_selector"))
+    wait_ms = int(config.get("wait_ms", 5000))
+    wait_selector = config.get("wait_selector") or dom_cfg.get("wait_selector")
+    goto_wait = config.get("goto_wait_until", "domcontentloaded")
+
     for page_num in range(1, max_pages + 1):
         page_url = (
             f"{target_url}&page={page_num}" if "?" in target_url
             else f"{target_url}?page={page_num}"
         )
+        diagnostics["pages_attempted"] += 1
+        page_ld_items = []
+        page_dom_items = []
+
         try:
-            page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(4000)
-            for script_text in page.locator('script[type="application/ld+json"]').all_inner_texts():
-                data = json.loads(script_text)
-                if data.get("@type") == config.get("root_type") and config.get("entity") in data:
-                    entity_val = data[config.get("entity")]
-                    list_key = config.get("list")
-                    if isinstance(entity_val, list):
-                        elements = entity_val
-                    elif isinstance(entity_val, dict) and list_key:
-                        inner = entity_val.get(list_key, [])
-                        elements = inner if isinstance(inner, list) else []
-                    else:
-                        elements = []
-                    for el in elements:
-                        item = el.get(config.get("item"), {})
-                        title = item.get(config.get("title"))
-                        url = item.get(config.get("url"))
-                        description = item.get(config.get("desc"), "")
-                        if title and url:
-                            item_id = url.rstrip("/").split("/")[-1]
-                            if item_id not in seen_ids:
-                                new_items.append({
-                                    "id": item_id,
-                                    "title": title,
-                                    "url": url,
-                                    "description": description[:150],
-                                })
-        except Exception:
-            continue
-    return new_items
+            page.goto(page_url, wait_until=goto_wait, timeout=30000)
+            if wait_selector:
+                try:
+                    page.wait_for_selector(wait_selector, timeout=15000)
+                except Exception as e:
+                    diagnostics["errors"].append(
+                        f"page {page_num}: wait_selector timeout: {e}"
+                    )
+            page.wait_for_timeout(wait_ms)
+            base_url = page.url
+
+            script_texts = page.locator('script[type="application/ld+json"]').all_inner_texts()
+            diagnostics["ld_json_script_count"] += len(script_texts)
+
+            for script_text in script_texts:
+                try:
+                    data = json.loads(script_text)
+                except json.JSONDecodeError as e:
+                    diagnostics["errors"].append(f"page {page_num}: LD+JSON parse: {e}")
+                    continue
+                _collect_ld_types(data, diagnostics["ld_json_types"])
+                page_ld_items.extend(_extract_ld_items(data, config, base_url, diagnostics))
+
+            if use_dom:
+                page_dom_items = _extract_dom_items(page, config, base_url, diagnostics)
+
+            page_items = _dedupe_items(page_ld_items + page_dom_items)
+            if page_ld_items and "ld_json" not in diagnostics["sources"]:
+                diagnostics["sources"].append("ld_json")
+            if page_dom_items and "dom" not in diagnostics["sources"]:
+                diagnostics["sources"].append("dom")
+
+            diagnostics["ld_items_count"] += len(page_ld_items)
+            diagnostics["dom_items_count"] += len(page_dom_items)
+
+            if not page_items:
+                diagnostics["errors"].append(
+                    f"page {page_num}: 0 items (ld={len(page_ld_items)}, dom={len(page_dom_items)})"
+                )
+            scraped_all.extend(page_items)
+
+        except Exception as e:
+            diagnostics["errors"].append(f"page {page_num}: {type(e).__name__}: {e}")
+
+    scraped_all = _dedupe_items(scraped_all)
+    new_items = [x for x in scraped_all if x["id"] not in seen_ids]
+    diagnostics["scraped_total"] = len(scraped_all)
+    diagnostics["new_count"] = len(new_items)
+    return new_items, diagnostics
 
 
 def scrape_detail(page, items, detail_cfg):
@@ -209,21 +484,28 @@ def scrape_detail(page, items, detail_cfg):
             for script_text in page.locator('script[type="application/ld+json"]').all_inner_texts():
                 try:
                     ld = json.loads(script_text)
-                    if ld.get("@type") == ld_type:
-                        if desc_path:
-                            detail["description"] = (
-                                _get_nested(ld, desc_path) or item.get("description", "")
-                            )[:600]
-                        rv = _get_nested(ld, rv_path) if rv_path else None
-                        rc = _get_nested(ld, rc_path) if rc_path else None
-                        price = _get_nested(ld, price_path) if price_path else None
-                        detail[rating_label] = (
-                            rating_fmt.replace("{v}", str(rv)).replace("{c}", str(rc))
-                            if rv and rc else "N/A"
-                        )
-                        if price:
-                            detail["price"] = str(price)
-                        break
+                    matched = False
+                    for node in _iter_ld_nodes(ld):
+                        if _ld_type_matches(node, ld_type):
+                            ld = node
+                            matched = True
+                            break
+                    if not matched:
+                        continue
+                    if desc_path:
+                        detail["description"] = (
+                            _get_nested(ld, desc_path) or item.get("description", "")
+                        )[:600]
+                    rv = _get_nested(ld, rv_path) if rv_path else None
+                    rc = _get_nested(ld, rc_path) if rc_path else None
+                    price = _get_nested(ld, price_path) if price_path else None
+                    detail[rating_label] = (
+                        rating_fmt.replace("{v}", str(rv)).replace("{c}", str(rc))
+                        if rv and rc else "N/A"
+                    )
+                    if price:
+                        detail["price"] = str(price)
+                    break
                 except Exception:
                     continue
         except Exception:
@@ -252,6 +534,8 @@ def main():
         PHASE2_PASS_FIELD = os.environ.get("PHASE2_PASS_FIELD", "pass")
         PHASE4_PASS_FIELD = os.environ.get("PHASE4_PASS_FIELD", "pass")
         NOTIFY_HEADER = os.environ.get("NOTIFY_HEADER", "New results")
+        NOTIFY_NO_NEW_HEADER = os.environ.get("NOTIFY_NO_NEW_HEADER", "No new items")
+        NOTIFY_SEED_HEADER = os.environ.get("NOTIFY_SEED_HEADER", "Initial seed done")
         NOTIFY_FIELDS = os.environ.get("NOTIFY_FIELDS", "[]")
         GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
         PASS_THRESHOLD = int(os.environ.get("PASS_THRESHOLD", "90"))
@@ -267,6 +551,7 @@ def main():
         seen_ids = load_seen_ids()
         new_items = []
         detailed_items = []
+        phase1_diag = _empty_phase1_diagnostics(seen_ids)
 
         current_phase = "phase1"
         with sync_playwright() as p:
@@ -280,17 +565,37 @@ def main():
             )
             pg = context.new_page()
             try:
-                new_items = scrape_listing(pg, parse_cfg, seen_ids, MAX_PAGES, TARGET_URL)
+                new_items, phase1_diag = scrape_listing(
+                    pg, parse_cfg, seen_ids, MAX_PAGES, TARGET_URL,
+                )
             finally:
                 browser.close()
 
+        if phase1_diag["scraped_total"] == 0:
+            send_error_to_slack(
+                SLACK_WEBHOOK_URL,
+                format_phase1_scrape_failure(phase1_diag),
+                current_phase="phase1",
+            )
+            secure_exit()
+
         if not new_items:
+            send_info_to_slack(
+                SLACK_WEBHOOK_URL,
+                NOTIFY_NO_NEW_HEADER,
+                format_phase1_no_new(phase1_diag),
+            )
             sys.exit(0)
 
         if len(seen_ids) == 0:
             for item in new_items:
                 seen_ids.add(item["id"])
             save_seen_ids(seen_ids)
+            send_info_to_slack(
+                SLACK_WEBHOOK_URL,
+                NOTIFY_SEED_HEADER,
+                format_phase1_seed(phase1_diag, len(new_items)),
+            )
             sys.exit(0)
 
         if PROMPT_PHASE2:
