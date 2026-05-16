@@ -13,6 +13,9 @@ from google.genai import types
 STATE_FILE = "seen_ids.txt"
 API_STATE_FILE = "api_state.json"
 
+# TEMP: phase2 検証用。確認後は False にするかブロックごと削除。
+PHASE2_SLACK_RAW_DUMP = True
+
 
 def _get_nested(obj, path):
     for key in path.split("."):
@@ -68,6 +71,68 @@ def send_info_to_slack(webhook_url, header, body):
 
 def secure_exit():
     sys.exit(1)
+
+
+def send_raw_slack_chunks(webhook_url, header, text, chunk_size=2800):
+    """検証用: 生テキストを分割して Slack に送る（Webhook のみ）。"""
+    if not webhook_url or text is None:
+        return
+    safe = str(text).replace("```", "'''")
+    chunks = [
+        safe[i:i + chunk_size]
+        for i in range(0, max(len(safe), 1), chunk_size)
+    ] if safe else ["(empty)"]
+    total = len(chunks)
+    for index, chunk in enumerate(chunks, start=1):
+        title = header[:120] if total == 1 else f"{header[:100]} ({index}/{total})"
+        body = f"```\n{chunk}\n```"
+        blocks = [
+            {"type": "header", "text": {"type": "plain_text", "text": title[:150]}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": body[:3000]}},
+        ]
+        try:
+            requests.post(webhook_url, json={"blocks": blocks}, timeout=15)
+        except Exception:
+            pass
+
+
+def send_phase2_raw_dump(webhook_url, input_items, raw_text, output_items):
+    """検証用: phase2 の入力・Gemini 生返答・パース後件数を Slack に送る。"""
+    input_ids = {str(x["id"]) for x in input_items if isinstance(x, dict) and x.get("id")}
+    output_ids = {
+        str(x["id"]) for x in output_items
+        if isinstance(x, dict) and x.get("id")
+    }
+    missing = sorted(input_ids - output_ids)[:20]
+    extra = sorted(output_ids - input_ids)[:20]
+    reasons = {}
+    for row in output_items:
+        if isinstance(row, dict):
+            r = str(row.get("reason", ""))
+            reasons[r] = reasons.get(r, 0) + 1
+    top_reasons = sorted(reasons.items(), key=lambda x: -x[1])[:8]
+
+    meta = "\n".join([
+        "Phase2 raw dump (verify)",
+        f"input_count: {len(input_items)}",
+        f"output_count: {len(output_items)}",
+        f"input_ids: {len(input_ids)}",
+        f"output_ids: {len(output_ids)}",
+        f"ids_match: {'yes' if input_ids == output_ids else 'no'}",
+        f"missing_in_output: {len(input_ids - output_ids)}"
+        + (f" e.g. {missing}" if missing else ""),
+        f"extra_in_output: {len(output_ids - input_ids)}"
+        + (f" e.g. {extra}" if extra else ""),
+        "top reasons:",
+        *[f"  [{n}] {r[:80]}" for r, n in top_reasons],
+    ])
+    send_info_to_slack(webhook_url, "Phase2 verify meta", meta)
+    send_raw_slack_chunks(
+        webhook_url,
+        "phase2_input_json",
+        json.dumps(input_items, ensure_ascii=False, indent=2),
+    )
+    send_raw_slack_chunks(webhook_url, "phase2_gemini_raw", raw_text)
 
 
 def finish_run(webhook_url, header, body):
@@ -1099,6 +1164,10 @@ def main():
             result2 = validate_json_list(
                 raw, phase2_fields, current_phase, pass_field=PHASE2_PASS_FIELD,
             )
+            if PHASE2_SLACK_RAW_DUMP:
+                send_phase2_raw_dump(
+                    SLACK_WEBHOOK_URL, new_items, raw, result2,
+                )
             partial_result = result2
             passed2 = filter_passed(result2, PHASE2_PASS_FIELD)
             if not passed2:
