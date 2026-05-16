@@ -282,6 +282,152 @@ def _extract_ld_items(data, config, base_url, diagnostics):
     return items
 
 
+_PAGE_STATE_EVAL = """
+(args) => {
+    const root = window[args.globalName];
+    if (root == null) {
+        return { ok: false, reason: "global_missing" };
+    }
+    let cur = root;
+    for (const part of args.path.split(".")) {
+        if (!part) continue;
+        if (cur == null || typeof cur !== "object") {
+            return { ok: false, reason: "path_break", part };
+        }
+        cur = cur[part];
+    }
+    if (!Array.isArray(cur)) {
+        return { ok: false, reason: "not_array", valueType: typeof cur };
+    }
+    return { ok: true, rows: cur };
+}
+"""
+
+
+def _probe_listing_page(page, config):
+    state_cfg = config.get("page_state") or {}
+    probe_cfg = config.get("probe") or {}
+    return page.evaluate(
+        """
+        (args) => {
+            const html = document.documentElement.outerHTML;
+            const substrings = (args.substrings || []).map((s) => ({
+                s,
+                found: s ? html.includes(s) : false,
+            }));
+            let stateInfo = null;
+            if (args.globalName) {
+                const root = window[args.globalName];
+                if (root == null) {
+                    stateInfo = { exists: false };
+                } else {
+                    let cur = root;
+                    let brokenAt = null;
+                    for (const part of (args.path || "").split(".")) {
+                        if (!part) continue;
+                        if (cur == null || typeof cur !== "object") {
+                            brokenAt = part;
+                            cur = null;
+                            break;
+                        }
+                        cur = cur[part];
+                    }
+                    stateInfo = {
+                        exists: true,
+                        pathBrokenAt: brokenAt,
+                        pathIsArray: Array.isArray(cur),
+                        listLength: Array.isArray(cur) ? cur.length : null,
+                    };
+                }
+            }
+            return {
+                title: document.title,
+                url: location.href,
+                htmlLength: html.length,
+                substrings,
+                stateInfo,
+            };
+        }
+        """,
+        {
+            "globalName": state_cfg.get("global"),
+            "path": state_cfg.get("path", ""),
+            "substrings": probe_cfg.get("html_substrings") or [],
+        },
+    )
+
+
+def _extract_page_state_items(page, config, base_url, diagnostics):
+    state_cfg = config.get("page_state") or {}
+    global_name = state_cfg.get("global")
+    data_path = state_cfg.get("path")
+    if not global_name or not data_path:
+        return []
+
+    id_key = state_cfg.get("id_key", "id")
+    title_key = state_cfg.get("title_key", "title")
+    desc_key = state_cfg.get("desc_key", "")
+    url_key = state_cfg.get("url_key", "")
+    url_template = state_cfg.get("url_template", "")
+    desc_max = int(state_cfg.get("desc_max_length", 150))
+
+    try:
+        result = page.evaluate(
+            _PAGE_STATE_EVAL,
+            {"globalName": global_name, "path": data_path},
+        )
+    except Exception as e:
+        diagnostics["errors"].append(f"page_state evaluate failed: {e}")
+        return []
+
+    if not result.get("ok"):
+        reason = result.get("reason", "unknown")
+        diagnostics["page_state_errors"].append(reason)
+        if reason == "path_break":
+            diagnostics["errors"].append(
+                f"page_state path break at '{result.get('part')}'"
+            )
+        elif reason == "global_missing":
+            diagnostics["errors"].append("page_state global not found on window")
+        elif reason == "not_array":
+            diagnostics["errors"].append(
+                f"page_state path is not an array (type={result.get('valueType')})"
+            )
+        return []
+
+    rows = result.get("rows") or []
+    diagnostics["page_state_list_length"] = max(
+        diagnostics.get("page_state_list_length", 0),
+        len(rows),
+    )
+    items = []
+    id_cfg = {**config, **state_cfg}
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_id = row.get(id_key)
+        if raw_id is None:
+            continue
+        item_id = str(raw_id)
+        title = row.get(title_key) or ""
+        description = ""
+        if desc_key:
+            description = row.get(desc_key) or ""
+        url = None
+        if url_key:
+            url = _normalize_url(row.get(url_key), base_url)
+        if not url and url_template:
+            url = url_template.replace("{id}", item_id)
+        if not url:
+            continue
+        if not _item_id_from_url(url, id_cfg):
+            item_id = _item_id_from_url(url, id_cfg) or item_id
+        items.append(_listing_record(item_id, title, url, str(description)[:desc_max]))
+
+    return items
+
+
 def _extract_dom_items(page, config, base_url, diagnostics):
     dom = config.get("dom") or {}
     link_selector = dom.get("link_selector")
@@ -342,11 +488,15 @@ def _empty_phase1_diagnostics(seen_ids):
         "ld_items_count": 0,
         "dom_link_count": 0,
         "dom_items_count": 0,
+        "page_state_items_count": 0,
+        "page_state_list_length": 0,
+        "page_state_errors": [],
         "scraped_total": 0,
         "new_count": 0,
         "seen_ids_count": len(seen_ids),
         "errors": [],
         "sources": [],
+        "runtime_probe": None,
     }
 
 
@@ -361,9 +511,36 @@ def format_phase1_scrape_failure(diag):
         f"LD items extracted: {diag['ld_items_count']}",
         f"DOM links seen: {diag['dom_link_count']}",
         f"DOM items extracted: {diag['dom_items_count']}",
+        f"Page state list length: {diag.get('page_state_list_length', 0)}",
+        f"Page state items extracted: {diag.get('page_state_items_count', 0)}",
         f"Parse sources used: {', '.join(diag['sources']) or 'none'}",
         f"Seen IDs loaded: {diag['seen_ids_count']}",
     ]
+    probe = diag.get("runtime_probe")
+    if probe:
+        lines.append("")
+        lines.append("Runtime probe (last page):")
+        lines.append(f"- Title: {probe.get('title', '')[:120]}")
+        lines.append(f"- URL: {probe.get('url', '')[:200]}")
+        lines.append(f"- HTML length: {probe.get('htmlLength', 0)}")
+        state_info = probe.get("stateInfo")
+        if state_info is not None:
+            if state_info.get("exists"):
+                lines.append(
+                    f"- Page state global: yes, path array={state_info.get('pathIsArray')}, "
+                    f"listLength={state_info.get('listLength')}"
+                )
+                if state_info.get("pathBrokenAt"):
+                    lines.append(f"- Page state path broken at: {state_info['pathBrokenAt']}")
+            else:
+                lines.append("- Page state global: not found on window")
+        for entry in probe.get("substrings") or []:
+            label = entry.get("s", "")
+            found = entry.get("found")
+            lines.append(f"- HTML contains {label!r}: {'yes' if found else 'no'}")
+    if diag.get("page_state_errors"):
+        lines.append("")
+        lines.append("Page state errors: " + ", ".join(diag["page_state_errors"]))
     if diag["errors"]:
         lines.append("")
         lines.append("Errors:")
@@ -371,8 +548,8 @@ def format_phase1_scrape_failure(diag):
             lines.append(f"- {err}")
     lines.extend([
         "",
-        "Likely cause: page structure changed, parse config mismatch, or load timeout.",
-        "Check PARSE_CONFIG (LD+JSON keys and optional dom block).",
+        "Likely cause: page structure changed, parse config mismatch, headless HTML diff, or load timeout.",
+        "Check PARSE_CONFIG (page_state / dom / LD+JSON) and probe.html_substrings.",
     ])
     return "\n".join(lines)
 
@@ -402,8 +579,12 @@ def scrape_listing(page, config, seen_ids, max_pages, target_url):
     scraped_all = []
     dom_cfg = config.get("dom") or {}
     use_dom = bool(dom_cfg.get("link_selector"))
+    use_page_state = bool((config.get("page_state") or {}).get("global"))
     wait_ms = int(config.get("wait_ms", 5000))
     wait_selector = config.get("wait_selector") or dom_cfg.get("wait_selector")
+    wait_selector_state = config.get("wait_selector_state") or dom_cfg.get(
+        "wait_selector_state", "visible"
+    )
     goto_wait = config.get("goto_wait_until", "domcontentloaded")
 
     for page_num in range(1, max_pages + 1):
@@ -414,12 +595,17 @@ def scrape_listing(page, config, seen_ids, max_pages, target_url):
         diagnostics["pages_attempted"] += 1
         page_ld_items = []
         page_dom_items = []
+        page_state_items = []
 
         try:
             page.goto(page_url, wait_until=goto_wait, timeout=30000)
             if wait_selector:
                 try:
-                    page.wait_for_selector(wait_selector, timeout=15000)
+                    page.wait_for_selector(
+                        wait_selector,
+                        timeout=15000,
+                        state=wait_selector_state,
+                    )
                 except Exception as e:
                     diagnostics["errors"].append(
                         f"page {page_num}: wait_selector timeout: {e}"
@@ -439,22 +625,36 @@ def scrape_listing(page, config, seen_ids, max_pages, target_url):
                 _collect_ld_types(data, diagnostics["ld_json_types"])
                 page_ld_items.extend(_extract_ld_items(data, config, base_url, diagnostics))
 
+            if use_page_state:
+                page_state_items = _extract_page_state_items(
+                    page, config, base_url, diagnostics,
+                )
+
             if use_dom:
                 page_dom_items = _extract_dom_items(page, config, base_url, diagnostics)
 
-            page_items = _dedupe_items(page_ld_items + page_dom_items)
+            page_items = _dedupe_items(page_ld_items + page_dom_items + page_state_items)
             if page_ld_items and "ld_json" not in diagnostics["sources"]:
                 diagnostics["sources"].append("ld_json")
             if page_dom_items and "dom" not in diagnostics["sources"]:
                 diagnostics["sources"].append("dom")
+            if page_state_items and "page_state" not in diagnostics["sources"]:
+                diagnostics["sources"].append("page_state")
 
             diagnostics["ld_items_count"] += len(page_ld_items)
             diagnostics["dom_items_count"] += len(page_dom_items)
+            diagnostics["page_state_items_count"] += len(page_state_items)
 
             if not page_items:
                 diagnostics["errors"].append(
-                    f"page {page_num}: 0 items (ld={len(page_ld_items)}, dom={len(page_dom_items)})"
+                    f"page {page_num}: 0 items "
+                    f"(ld={len(page_ld_items)}, dom={len(page_dom_items)}, "
+                    f"state={len(page_state_items)})"
                 )
+                try:
+                    diagnostics["runtime_probe"] = _probe_listing_page(page, config)
+                except Exception as e:
+                    diagnostics["errors"].append(f"page {page_num}: runtime probe failed: {e}")
             scraped_all.extend(page_items)
 
         except Exception as e:
@@ -555,13 +755,19 @@ def main():
 
         current_phase = "phase1"
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
             context = browser.new_context(
                 user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                )
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                locale="ja-JP",
+            )
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
             )
             pg = context.new_page()
             try:
@@ -625,13 +831,19 @@ def main():
             passed2_ids = {x["id"] for x in passed2}
             items_for_detail = [x for x in new_items if x["id"] in passed2_ids]
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
                 context = browser.new_context(
                     user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    )
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    locale="ja-JP",
+                )
+                context.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
                 )
                 pg = context.new_page()
                 try:
