@@ -75,28 +75,104 @@ def finish_run(webhook_url, header, body):
     sys.exit(0)
 
 
-def _format_ai_sample(items, sample_max, prefer_keys=None):
+_SCORE_KEYS = ("screening_score", "safety_score", "score")
+
+
+def _score_for_sort(item):
+    for key in _SCORE_KEYS:
+        value = item.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                continue
+    return -1.0
+
+
+def _resolve_item_url(item, url_template):
+    url = item.get("url")
+    if url and isinstance(url, str):
+        return url
+    item_id = item.get("id")
+    if item_id and url_template:
+        return url_template.replace("{id}", str(item_id))
+    return None
+
+
+def _slack_link(url, label):
+    safe_url = str(url).replace(">", "%3E")
+    safe_label = str(label).replace("|", "/")
+    return f"<{safe_url}|{safe_label}>"
+
+
+def _format_slack_field_value(key, value, entry, url_template):
+    if key in ("id", "url"):
+        link_url = value if key == "url" and value else _resolve_item_url(entry, url_template)
+        if link_url:
+            label = entry.get("id", value) if key == "url" else value
+            return _slack_link(link_url, label)
+    text = str(value)
+    if len(text) > 500:
+        text = text[:500] + "...(truncated)"
+    return text
+
+
+def _url_by_id_from_items(items):
+    return {
+        str(item["id"]): item["url"]
+        for item in items
+        if isinstance(item, dict) and item.get("id") and item.get("url")
+    }
+
+
+def _enrich_items_urls(items, url_by_id, url_template):
+    if not isinstance(items, list):
+        return
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("url"):
+            continue
+        item_id = str(item.get("id", ""))
+        if item_id and item_id in url_by_id:
+            item["url"] = url_by_id[item_id]
+        elif item_id and url_template:
+            item["url"] = url_template.replace("{id}", item_id)
+
+
+def _format_ai_sample(items, sample_max, prefer_keys=None, url_template=None):
     if not isinstance(items, list) or not items:
         return []
     keys = prefer_keys or (
         "id", "pass", "screening_score", "safety_score", "score", "reason",
     )
+    ranked = sorted(
+        [x for x in items if isinstance(x, dict)],
+        key=_score_for_sort,
+        reverse=True,
+    )
     lines = []
-    for item in items[:sample_max]:
-        if not isinstance(item, dict):
-            continue
+    for item in ranked[:sample_max]:
         parts = []
         for key in keys:
             if key not in item:
                 continue
             value = item[key]
-            text = str(value)
-            if len(text) > 100:
-                text = text[:100] + "..."
+            if key == "id":
+                url = _resolve_item_url(item, url_template)
+                text = _slack_link(url, value) if url else str(value)
+            else:
+                text = str(value)
+                if len(text) > 100:
+                    text = text[:100] + "..."
             parts.append(f"{key}={text}")
         if parts:
             lines.append("  - " + ", ".join(parts))
-    remaining = len(items) - sample_max
+    remaining = len(ranked) - sample_max
     if remaining > 0:
         lines.append(f"  - ... and {remaining} more")
     return lines
@@ -141,9 +217,21 @@ def format_run_summary(exit_reason, **ctx):
     partial = ctx.get("partial_result")
     sample_max = ctx.get("sample_max", 5)
     if partial:
-        sample_lines = _format_ai_sample(partial, sample_max, ctx.get("sample_keys"))
+        url_by_id = ctx.get("url_by_id") or {}
+        _enrich_items_urls(partial, url_by_id, ctx.get("url_template"))
+        score_key = next(
+            (k for k in _SCORE_KEYS if isinstance(partial, list) and partial
+             and isinstance(partial[0], dict) and k in partial[0]),
+            "score",
+        )
+        sample_lines = _format_ai_sample(
+            partial,
+            sample_max,
+            ctx.get("sample_keys"),
+            url_template=ctx.get("url_template"),
+        )
         if sample_lines:
-            lines.append(f"Sample (up to {sample_max}):")
+            lines.append(f"Top {sample_max} by {score_key} (pass not required):")
             lines.extend(sample_lines)
             lines.append("")
     if "seen_before" in ctx and "seen_after" in ctx:
@@ -497,9 +585,8 @@ def _extract_page_state_items(page, config, base_url, diagnostics):
             continue
         item_id = str(raw_id)
         title = row.get(title_key) or ""
-        description = ""
-        if desc_key:
-            description = row.get(desc_key) or ""
+        desc_text = row.get(desc_key) or "" if desc_key else ""
+        description = _build_listing_description(title, desc_text, desc_max)
         url = None
         if url_key:
             url = _normalize_url(row.get(url_key), base_url)
@@ -514,6 +601,16 @@ def _extract_page_state_items(page, config, base_url, diagnostics):
     return items
 
 
+def _build_listing_description(title, desc, desc_max):
+    title = (title or "").strip()
+    desc = (desc or "").strip()
+    if desc and title and desc != title:
+        combined = f"{title} — {desc}"
+    else:
+        combined = desc or title
+    return combined[:desc_max]
+
+
 def _extract_dom_items(page, config, base_url, diagnostics):
     dom = config.get("dom") or {}
     link_selector = dom.get("link_selector")
@@ -522,9 +619,73 @@ def _extract_dom_items(page, config, base_url, diagnostics):
 
     id_regex = dom.get("id_regex", "")
     title_min = int(dom.get("title_min_length", 1))
-    desc_max = int(dom.get("desc_max_length", 150))
+    desc_max = int(dom.get("desc_max_length", 300))
+    ancestor_selector = dom.get("ancestor_selector", "")
+    desc_selector = dom.get("desc_selector", "")
+    title_selector = dom.get("title_selector", "")
     items = []
     seen_hrefs = set()
+    id_cfg = dom if dom.get("id_regex") else config
+
+    if ancestor_selector or desc_selector or title_selector:
+        try:
+            raw_rows = page.evaluate(
+                """
+                (args) => {
+                    const rows = [];
+                    const seen = new Set();
+                    for (const link of document.querySelectorAll(args.linkSelector)) {
+                        const href = link.href || link.getAttribute("href") || "";
+                        if (!href || seen.has(href)) continue;
+                        seen.add(href);
+                        const card = args.ancestorSelector
+                            ? link.closest(args.ancestorSelector)
+                            : link.parentElement;
+                        let title = (link.innerText || "").trim();
+                        if (args.titleSelector && card) {
+                            const t = card.querySelector(args.titleSelector);
+                            if (t) title = (t.innerText || "").trim() || title;
+                        }
+                        let desc = "";
+                        if (args.descSelector && card) {
+                            const d = card.querySelector(args.descSelector);
+                            desc = d ? (d.innerText || "").trim() : "";
+                        }
+                        rows.push({ href, title, desc });
+                    }
+                    return rows;
+                }
+                """,
+                {
+                    "linkSelector": link_selector,
+                    "ancestorSelector": ancestor_selector,
+                    "descSelector": desc_selector,
+                    "titleSelector": title_selector,
+                },
+            )
+        except Exception as e:
+            diagnostics["errors"].append(f"DOM structured extract failed: {e}")
+            raw_rows = []
+        diagnostics["dom_link_count"] += len(raw_rows)
+        for row in raw_rows:
+            href = row.get("href") or ""
+            if href in seen_hrefs:
+                continue
+            seen_hrefs.add(href)
+            url = _normalize_url(href, base_url)
+            if not url:
+                continue
+            item_id = _item_id_from_url(url, id_cfg)
+            if not item_id:
+                continue
+            title = (row.get("title") or "").strip()
+            if len(title) < title_min:
+                title = f"item-{item_id}"
+            description = _build_listing_description(
+                title, row.get("desc") or "", desc_max,
+            )
+            items.append(_listing_record(item_id, title, url, description))
+        return items
 
     try:
         links = page.locator(link_selector).all()
@@ -545,7 +706,7 @@ def _extract_dom_items(page, config, base_url, diagnostics):
         url = _normalize_url(href, base_url)
         if not url:
             continue
-        item_id = _item_id_from_url(url, dom if dom.get("id_regex") else config)
+        item_id = _item_id_from_url(url, id_cfg)
         if not item_id:
             continue
         try:
@@ -554,7 +715,8 @@ def _extract_dom_items(page, config, base_url, diagnostics):
             title = ""
         if len(title) < title_min:
             title = f"item-{item_id}"
-        items.append(_listing_record(item_id, title, url, title[:desc_max]))
+        description = _build_listing_description(title, "", desc_max)
+        items.append(_listing_record(item_id, title, url, description))
     return items
 
 
@@ -851,7 +1013,11 @@ def main():
 
         parse_cfg = json.loads(PARSE_CONFIG)
         notify_fields = json.loads(NOTIFY_FIELDS)
+        NOTIFY_URL_TEMPLATE = os.environ.get("NOTIFY_URL_TEMPLATE", "") or (
+            (parse_cfg.get("page_state") or {}).get("url_template", "")
+        )
         new_items = []
+        url_by_id = {}
         detailed_items = []
         phase1_diag = _empty_phase1_diagnostics(seen_ids)
 
@@ -878,6 +1044,8 @@ def main():
                 )
             finally:
                 browser.close()
+
+        url_by_id = _url_by_id_from_items(new_items)
 
         if phase1_diag["scraped_total"] == 0:
             send_error_to_slack(
@@ -952,6 +1120,8 @@ def main():
                         seen_saved=True,
                         gemini_calls=gemini_calls,
                         sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
+                        url_template=NOTIFY_URL_TEMPLATE,
+                        url_by_id=url_by_id,
                     ),
                 )
         else:
@@ -1021,6 +1191,8 @@ def main():
                         sample_keys=(
                             "id", "pass", "safety_score", "reason",
                         ),
+                        url_template=NOTIFY_URL_TEMPLATE,
+                        url_by_id=url_by_id,
                     ),
                 )
         else:
@@ -1062,6 +1234,8 @@ def main():
                     seen_saved=True,
                     gemini_calls=gemini_calls,
                     sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
+                    url_template=NOTIFY_URL_TEMPLATE,
+                    url_by_id=url_by_id,
                 ),
             )
 
@@ -1080,9 +1254,9 @@ def main():
                 key = nf.get("key", "")
                 value = entry.get(key, "")
                 if value:
-                    text = str(value)
-                    if len(text) > 500:
-                        text = text[:500] + "...(truncated)"
+                    text = _format_slack_field_value(
+                        key, value, entry, NOTIFY_URL_TEMPLATE,
+                    )
                     lines.append(f"*{label}:* {text}")
             text_body = "\n".join(lines)
             if text_body:
@@ -1106,6 +1280,8 @@ def main():
             gemini_calls=gemini_calls,
             sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
             sample_keys=("id", "score", "pass", "reason"),
+            url_template=NOTIFY_URL_TEMPLATE,
+            url_by_id=url_by_id,
         )
 
         if len(blocks) > 1:
