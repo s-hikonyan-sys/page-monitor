@@ -70,6 +70,92 @@ def secure_exit():
     sys.exit(1)
 
 
+def finish_run(webhook_url, header, body):
+    send_info_to_slack(webhook_url, header, body)
+    sys.exit(0)
+
+
+def _format_ai_sample(items, sample_max, prefer_keys=None):
+    if not isinstance(items, list) or not items:
+        return []
+    keys = prefer_keys or (
+        "id", "pass", "screening_score", "safety_score", "score", "reason",
+    )
+    lines = []
+    for item in items[:sample_max]:
+        if not isinstance(item, dict):
+            continue
+        parts = []
+        for key in keys:
+            if key not in item:
+                continue
+            value = item[key]
+            text = str(value)
+            if len(text) > 100:
+                text = text[:100] + "..."
+            parts.append(f"{key}={text}")
+        if parts:
+            lines.append("  - " + ", ".join(parts))
+    remaining = len(items) - sample_max
+    if remaining > 0:
+        lines.append(f"  - ... and {remaining} more")
+    return lines
+
+
+def format_run_summary(exit_reason, **ctx):
+    lines = [f"Exit: {exit_reason}", ""]
+    phase1_diag = ctx.get("phase1_diag")
+    if phase1_diag:
+        sources = ", ".join(phase1_diag.get("sources") or []) or "n/a"
+        lines.extend([
+            "Phase1:",
+            f"  scraped: {phase1_diag.get('scraped_total', 0)}",
+            f"  new: {phase1_diag.get('new_count', 0)}",
+            f"  sources: {sources}",
+            "",
+        ])
+    if "phase2_input" in ctx:
+        lines.extend([
+            "Phase2:",
+            f"  input: {ctx['phase2_input']}",
+            f"  passed: {ctx.get('phase2_passed', 0)}",
+            f"  pass_field: {ctx.get('pass_field', 'pass')}",
+            "",
+        ])
+    if "phase4_input" in ctx:
+        lines.extend([
+            "Phase4:",
+            f"  input: {ctx['phase4_input']}",
+            f"  passed: {ctx.get('phase4_passed', 0)}",
+            f"  pass_field: {ctx.get('pass_field', 'pass')}",
+            "",
+        ])
+    if "phase5_total" in ctx:
+        lines.extend([
+            "Phase5:",
+            f"  results: {ctx['phase5_total']}",
+            f"  notified (score>={ctx.get('pass_threshold', '?')}): "
+            f"{ctx.get('notified_count', 0)}",
+            "",
+        ])
+    partial = ctx.get("partial_result")
+    sample_max = ctx.get("sample_max", 5)
+    if partial:
+        sample_lines = _format_ai_sample(partial, sample_max, ctx.get("sample_keys"))
+        if sample_lines:
+            lines.append(f"Sample (up to {sample_max}):")
+            lines.extend(sample_lines)
+            lines.append("")
+    if "seen_before" in ctx and "seen_after" in ctx:
+        lines.append(
+            f"seen_ids: {ctx['seen_before']} -> {ctx['seen_after']}"
+            + (" (saved)" if ctx.get("seen_saved") else "")
+        )
+    if "gemini_calls" in ctx:
+        lines.append(f"gemini_calls: {ctx['gemini_calls']}")
+    return "\n".join(lines).strip()
+
+
 def load_seen_ids():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -736,19 +822,35 @@ def main():
         NOTIFY_HEADER = os.environ.get("NOTIFY_HEADER", "New results")
         NOTIFY_NO_NEW_HEADER = os.environ.get("NOTIFY_NO_NEW_HEADER", "No new items")
         NOTIFY_SEED_HEADER = os.environ.get("NOTIFY_SEED_HEADER", "Initial seed done")
+        NOTIFY_PHASE2_REJECTED_HEADER = os.environ.get(
+            "NOTIFY_PHASE2_REJECTED_HEADER", "Run complete: phase2 all rejected",
+        )
+        NOTIFY_PHASE4_REJECTED_HEADER = os.environ.get(
+            "NOTIFY_PHASE4_REJECTED_HEADER", "Run complete: phase4 all rejected",
+        )
+        NOTIFY_PHASE5_EMPTY_HEADER = os.environ.get(
+            "NOTIFY_PHASE5_EMPTY_HEADER", "Run complete: phase5 empty",
+        )
+        NOTIFY_BELOW_THRESHOLD_HEADER = os.environ.get(
+            "NOTIFY_BELOW_THRESHOLD_HEADER", "Run complete: below score threshold",
+        )
+        NOTIFY_SUCCESS_SUMMARY_HEADER = os.environ.get("NOTIFY_SUCCESS_SUMMARY_HEADER", "")
         NOTIFY_FIELDS = os.environ.get("NOTIFY_FIELDS", "[]")
         GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
         PASS_THRESHOLD = int(os.environ.get("PASS_THRESHOLD", "90"))
         MAX_PAGES = int(os.environ.get("MAX_PAGES", "1"))
         MAX_API_USAGE = int(os.environ.get("MAX_API_USAGE", "1000"))
         RESET_HOUR_UTC = int(os.environ.get("RESET_HOUR_UTC", "0"))
+        NOTIFY_SUMMARY_SAMPLE_MAX = int(os.environ.get("NOTIFY_SUMMARY_SAMPLE_MAX", "5"))
+        gemini_calls = 0
+        seen_ids = load_seen_ids()
+        seen_ids_before = len(seen_ids)
 
         if not all([TARGET_URL, KEYS_STR, SLACK_WEBHOOK_URL, AI_PROMPT, PARSE_CONFIG]):
             raise ValueError("Required environment variables are not configured.")
 
         parse_cfg = json.loads(PARSE_CONFIG)
         notify_fields = json.loads(NOTIFY_FIELDS)
-        seen_ids = load_seen_ids()
         new_items = []
         detailed_items = []
         phase1_diag = _empty_phase1_diagnostics(seen_ids)
@@ -786,23 +888,36 @@ def main():
             secure_exit()
 
         if not new_items:
-            send_info_to_slack(
+            finish_run(
                 SLACK_WEBHOOK_URL,
                 NOTIFY_NO_NEW_HEADER,
-                format_phase1_no_new(phase1_diag),
+                format_run_summary(
+                    "phase1_no_new",
+                    phase1_diag=phase1_diag,
+                    seen_before=seen_ids_before,
+                    seen_after=seen_ids_before,
+                    gemini_calls=gemini_calls,
+                    sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
+                ) + "\n\n" + format_phase1_no_new(phase1_diag),
             )
-            sys.exit(0)
 
         if len(seen_ids) == 0:
             for item in new_items:
                 seen_ids.add(item["id"])
             save_seen_ids(seen_ids)
-            send_info_to_slack(
+            finish_run(
                 SLACK_WEBHOOK_URL,
                 NOTIFY_SEED_HEADER,
-                format_phase1_seed(phase1_diag, len(new_items)),
+                format_run_summary(
+                    "phase1_seed",
+                    phase1_diag=phase1_diag,
+                    seen_before=0,
+                    seen_after=len(seen_ids),
+                    seen_saved=True,
+                    gemini_calls=gemini_calls,
+                    sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
+                ) + "\n\n" + format_phase1_seed(phase1_diag, len(new_items)),
             )
-            sys.exit(0)
 
         if PROMPT_PHASE2:
             current_phase = "phase2"
@@ -812,6 +927,7 @@ def main():
                 build_phase_prompt(AI_PROMPT, PROMPT_PHASE2, new_items),
                 GEMINI_MODEL,
             )
+            gemini_calls += 1
             result2 = validate_json_list(
                 raw, phase2_fields, current_phase, pass_field=PHASE2_PASS_FIELD,
             )
@@ -821,7 +937,23 @@ def main():
                 for item in new_items:
                     seen_ids.add(item["id"])
                 save_seen_ids(seen_ids)
-                sys.exit(0)
+                finish_run(
+                    SLACK_WEBHOOK_URL,
+                    NOTIFY_PHASE2_REJECTED_HEADER,
+                    format_run_summary(
+                        "phase2_all_rejected",
+                        phase1_diag=phase1_diag,
+                        phase2_input=len(new_items),
+                        phase2_passed=0,
+                        pass_field=PHASE2_PASS_FIELD,
+                        partial_result=result2,
+                        seen_before=seen_ids_before,
+                        seen_after=len(seen_ids),
+                        seen_saved=True,
+                        gemini_calls=gemini_calls,
+                        sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
+                    ),
+                )
         else:
             passed2 = new_items
 
@@ -858,6 +990,7 @@ def main():
                 build_phase_prompt(AI_PROMPT, PROMPT_PHASE4, detailed_items),
                 GEMINI_MODEL,
             )
+            gemini_calls += 1
             result4 = validate_json_list(
                 raw, phase4_fields, current_phase, pass_field=PHASE4_PASS_FIELD,
             )
@@ -868,7 +1001,28 @@ def main():
                 for item in new_items:
                     seen_ids.add(item["id"])
                 save_seen_ids(seen_ids)
-                sys.exit(0)
+                finish_run(
+                    SLACK_WEBHOOK_URL,
+                    NOTIFY_PHASE4_REJECTED_HEADER,
+                    format_run_summary(
+                        "phase4_all_rejected",
+                        phase1_diag=phase1_diag,
+                        phase2_input=len(new_items),
+                        phase2_passed=len(passed2),
+                        phase4_input=len(detailed_items),
+                        phase4_passed=0,
+                        pass_field=PHASE4_PASS_FIELD,
+                        partial_result=result4,
+                        seen_before=seen_ids_before,
+                        seen_after=len(seen_ids),
+                        seen_saved=True,
+                        gemini_calls=gemini_calls,
+                        sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
+                        sample_keys=(
+                            "id", "pass", "safety_score", "reason",
+                        ),
+                    ),
+                )
         else:
             passed4 = passed2
 
@@ -881,6 +1035,7 @@ def main():
                 build_phase_prompt(AI_PROMPT, PROMPT_PHASE5, phase5_input),
                 GEMINI_MODEL,
             )
+            gemini_calls += 1
             result5 = validate_json_list(raw, phase5_fields, current_phase)
             result5 = merge_items_by_id(phase5_input, result5)
             partial_result = result5
@@ -890,17 +1045,35 @@ def main():
         for item in new_items:
             seen_ids.add(item["id"])
         save_seen_ids(seen_ids)
+        seen_ids_after = len(seen_ids)
 
         if not result5:
-            sys.exit(0)
+            finish_run(
+                SLACK_WEBHOOK_URL,
+                NOTIFY_PHASE5_EMPTY_HEADER,
+                format_run_summary(
+                    "phase5_empty",
+                    phase1_diag=phase1_diag,
+                    phase2_input=len(new_items),
+                    phase2_passed=len(passed2) if PROMPT_PHASE2 else len(new_items),
+                    phase5_total=0,
+                    seen_before=seen_ids_before,
+                    seen_after=seen_ids_after,
+                    seen_saved=True,
+                    gemini_calls=gemini_calls,
+                    sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
+                ),
+            )
 
         blocks = [
             {"type": "header", "text": {"type": "plain_text", "text": NOTIFY_HEADER}},
         ]
+        notified_count = 0
         for entry in result5:
             score = entry.get("score", 0)
             if isinstance(score, (int, float)) and score < PASS_THRESHOLD:
                 continue
+            notified_count += 1
             lines = []
             for nf in notify_fields:
                 label = nf.get("label", nf.get("key", ""))
@@ -916,8 +1089,35 @@ def main():
                 blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text_body}})
                 blocks.append({"type": "divider"})
 
+        summary_body = format_run_summary(
+            "success" if len(blocks) > 1 else "below_threshold",
+            phase1_diag=phase1_diag,
+            phase2_input=len(new_items),
+            phase2_passed=len(passed2) if PROMPT_PHASE2 else len(new_items),
+            phase4_input=len(detailed_items) if detailed_items else 0,
+            phase4_passed=len(passed4) if (DETAIL_CONFIG and PROMPT_PHASE4) else 0,
+            phase5_total=len(result5),
+            notified_count=notified_count,
+            pass_threshold=PASS_THRESHOLD,
+            partial_result=result5 if len(blocks) <= 1 else None,
+            seen_before=seen_ids_before,
+            seen_after=seen_ids_after,
+            seen_saved=True,
+            gemini_calls=gemini_calls,
+            sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
+            sample_keys=("id", "score", "pass", "reason"),
+        )
+
         if len(blocks) > 1:
             requests.post(SLACK_WEBHOOK_URL, json={"blocks": blocks}, timeout=10)
+            if NOTIFY_SUCCESS_SUMMARY_HEADER:
+                send_info_to_slack(
+                    SLACK_WEBHOOK_URL, NOTIFY_SUCCESS_SUMMARY_HEADER, summary_body,
+                )
+        else:
+            finish_run(
+                SLACK_WEBHOOK_URL, NOTIFY_BELOW_THRESHOLD_HEADER, summary_body,
+            )
 
     except Exception:
         error_msg = traceback.format_exc()
