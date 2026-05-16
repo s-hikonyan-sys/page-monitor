@@ -10,6 +10,7 @@ from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 from google import genai
 from google.genai import types
+from google.genai.errors import ClientError
 
 STATE_FILE = "seen_ids.txt"
 API_STATE_FILE = "api_state.json"
@@ -271,7 +272,7 @@ def save_api_state(state):
 
 
 def get_current_api_key(keys_str, max_usage, reset_hour_utc):
-    keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+    keys = _parse_key_list(keys_str)
     if not keys:
         raise ValueError("API keys not configured.")
     state = load_api_state()
@@ -288,17 +289,75 @@ def get_current_api_key(keys_str, max_usage, reset_hour_utc):
     return keys[state["current_index"]], state
 
 
-def call_gemini(keys_str, max_usage, reset_hour_utc, prompt_text, model_name):
-    current_key, api_state = get_current_api_key(keys_str, max_usage, reset_hour_utc)
-    client = genai.Client(api_key=current_key)
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt_text,
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
-    api_state["usage_count"] += 1
+def _parse_key_list(keys_str):
+    return [k.strip() for k in keys_str.split(",") if k.strip()]
+
+
+def _record_api_attempt(api_state):
+    api_state["usage_count"] = int(api_state.get("usage_count", 0)) + 1
     save_api_state(api_state)
-    return response.text
+
+
+def _rotate_api_key_index(api_state, key_count):
+    api_state["current_index"] = (int(api_state.get("current_index", 0)) + 1) % key_count
+    api_state["usage_count"] = 0
+    save_api_state(api_state)
+
+
+def _is_rate_limit_error(exc):
+    if isinstance(exc, ClientError):
+        return getattr(exc, "status_code", None) == 429
+    return False
+
+
+def _parse_429_retry_seconds(exc, default_sec):
+    try:
+        response_json = getattr(exc, "response_json", None) or {}
+        error = response_json.get("error", {})
+        for detail in error.get("details", []):
+            if "RetryInfo" in str(detail.get("@type", "")):
+                delay = detail.get("retryDelay", "")
+                if isinstance(delay, str) and delay.endswith("s"):
+                    return max(1, int(float(delay[:-1])))
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return default_sec
+
+
+def call_gemini(keys_str, max_usage, reset_hour_utc, prompt_text, model_name):
+    key_list = _parse_key_list(keys_str)
+    if not key_list:
+        raise ValueError("API keys not configured.")
+
+    retry_delay_sec = int(os.environ.get("GEMINI_429_RETRY_SEC", "60"))
+    max_attempts = len(key_list)
+    last_exc = None
+
+    for _ in range(max_attempts):
+        current_key, api_state = get_current_api_key(keys_str, max_usage, reset_hour_utc)
+        try:
+            client = genai.Client(api_key=current_key)
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt_text,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                ),
+            )
+            _record_api_attempt(api_state)
+            return response.text
+        except Exception as e:
+            last_exc = e
+            _record_api_attempt(api_state)
+            if _is_rate_limit_error(e):
+                _rotate_api_key_index(api_state, len(key_list))
+                time.sleep(_parse_429_retry_seconds(e, retry_delay_sec))
+                continue
+            raise
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Gemini API call failed")
 
 
 def _chunk_list(items, batch_size):

@@ -60,9 +60,11 @@ jobs:
           RESET_HOUR_UTC: ${{ vars.RESET_HOUR_UTC }}
           GEMINI_BATCH_SIZE: ${{ vars.GEMINI_BATCH_SIZE }}
           GEMINI_BATCH_INTERVAL_SEC: ${{ vars.GEMINI_BATCH_INTERVAL_SEC }}
+          GEMINI_429_RETRY_SEC: ${{ vars.GEMINI_429_RETRY_SEC }}
         run: python monitor.py
 
       - name: Commit and Push State
+        if: always()
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
