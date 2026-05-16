@@ -210,7 +210,7 @@ def format_run_summary(exit_reason, **ctx):
         lines.extend([
             "Phase5:",
             f"  results: {ctx['phase5_total']}",
-            f"  notified (score>={ctx.get('pass_threshold', '?')}): "
+            f"  notified (pass=true, score>={ctx.get('pass_threshold', '?')}): "
             f"{ctx.get('notified_count', 0)}",
             "",
         ])
@@ -1198,10 +1198,14 @@ def main():
         else:
             passed4 = passed2
 
+        notify_pass_field = (
+            PHASE4_PASS_FIELD if (DETAIL_CONFIG and PROMPT_PHASE4) else PHASE2_PASS_FIELD
+        )
+
         if PROMPT_PHASE5:
             current_phase = "phase5"
             phase5_fields = [f.strip() for f in PHASE5_FIELDS.split(",") if f.strip()]
-            phase5_input = merge_items_by_id(detailed_items, passed4) if detailed_items else passed4
+            phase5_input = passed4
             raw = call_gemini(
                 KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
                 build_phase_prompt(AI_PROMPT, PROMPT_PHASE5, phase5_input),
@@ -1212,7 +1216,7 @@ def main():
             result5 = merge_items_by_id(phase5_input, result5)
             partial_result = result5
         else:
-            result5 = merge_items_by_id(detailed_items, passed4) if detailed_items else passed4
+            result5 = passed4
 
         for item in new_items:
             seen_ids.add(item["id"])
@@ -1244,8 +1248,10 @@ def main():
         ]
         notified_count = 0
         for entry in result5:
-            score = entry.get("score", 0)
-            if isinstance(score, (int, float)) and score < PASS_THRESHOLD:
+            if entry.get(notify_pass_field) is not True:
+                continue
+            score = entry.get("score", entry.get("safety_score", 0))
+            if not isinstance(score, (int, float)) or score < PASS_THRESHOLD:
                 continue
             notified_count += 1
             lines = []
