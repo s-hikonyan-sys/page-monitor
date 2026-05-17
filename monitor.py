@@ -131,7 +131,7 @@ def _slack_link(url, label):
 _SLACK_LIMIT_PROPOSAL = 1200
 _SLACK_LIMIT_LONG = 800
 _SLACK_LIMIT_DEFAULT = 500
-_SLACK_LONG_TEXT_KEYS = frozenset({
+_SLACK_BULLET_KEYS = frozenset({
     "risk_findings",
     "risk_revision_guidance",
     "risk_advisory_notes",
@@ -142,12 +142,61 @@ _SLACK_LONG_TEXT_KEYS = frozenset({
     "credibility_bad",
     "final_credibility_good",
     "final_credibility_bad",
+})
+_SLACK_LONG_TEXT_KEYS = _SLACK_BULLET_KEYS | frozenset({
     "buyer_pain_point",
     "final_buyer_pain_point",
     "technical_requirements",
     "implementation_challenges",
     "proposed_solutions_to_implementation_challenges",
 })
+
+
+def _bullet_line(text):
+    s = str(text).strip()
+    if not s:
+        return ""
+    for prefix in ("- ", "・", "• ", "* "):
+        if s.startswith(prefix):
+            s = s[len(prefix):].strip()
+            break
+    if s.startswith("-") and len(s) > 1 and s[1] != "-":
+        s = s[1:].strip()
+    return f"- {s}"
+
+
+def _normalize_slack_bullet_text(value):
+    """findings / guidance を Slack 向けの箇条書き文字列に正規化する。"""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, list):
+        lines = [_bullet_line(item) for item in value if item is not None and str(item).strip()]
+        return "\n".join(line for line in lines if line)
+    if isinstance(value, dict):
+        lines = []
+        for k, v in value.items():
+            if v is None or v == "":
+                continue
+            lines.append(_bullet_line(f"{k}: {v}"))
+        return "\n".join(lines)
+    text = str(value).strip()
+    if not text:
+        return ""
+    if text.startswith("[") or text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+            return _normalize_slack_bullet_text(parsed)
+        except json.JSONDecodeError:
+            pass
+    text = text.replace("\\n", "\n")
+    lines = []
+    for raw in text.split("\n"):
+        line = _bullet_line(raw)
+        if line:
+            lines.append(line)
+    return "\n".join(lines) if lines else text
 
 _PROPOSAL_INPUT_KEYS = (
     "id", "title", "url", "description", "meta1", "work_estimate", "delivery_text",
@@ -173,7 +222,9 @@ def _format_slack_field_value(key, value, entry, url_template):
         if link_url:
             label = entry.get("id", value) if key == "url" else value
             return _slack_link(link_url, label)
-    if isinstance(value, (dict, list)):
+    if key in _SLACK_BULLET_KEYS:
+        text = _normalize_slack_bullet_text(value)
+    elif isinstance(value, (dict, list)):
         text = json.dumps(value, ensure_ascii=False)
     else:
         text = str(value)
@@ -662,7 +713,10 @@ def _format_notify_entries(items, notify_field_specs, url_template, pass_field=N
             value = entry.get(key, "")
             if value:
                 text = _format_slack_field_value(key, value, entry, url_template)
-                lines.append(f"*{label}:* {text}")
+                if key in _SLACK_BULLET_KEYS and "\n" in text:
+                    lines.append(f"*{label}:*\n{text}")
+                else:
+                    lines.append(f"*{label}:* {text}")
         if lines:
             blocks_body.append("\n".join(lines))
     return blocks_body
