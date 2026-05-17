@@ -186,8 +186,9 @@ def _format_ai_sample(items, sample_max, prefer_keys=None, url_template=None):
                 text = _slack_link(url, value) if url else str(value)
             else:
                 text = str(value)
-                if len(text) > 100:
-                    text = text[:100] + "..."
+                limit = 180 if key == "reason" else 100
+                if len(text) > limit:
+                    text = text[:limit] + "..."
             parts.append(f"{key}={text}")
         if parts:
             lines.append("  - " + ", ".join(parts))
@@ -1135,7 +1136,7 @@ def main():
         NOTIFY_SUCCESS_SUMMARY_HEADER = os.environ.get("NOTIFY_SUCCESS_SUMMARY_HEADER", "")
         NOTIFY_FIELDS = os.environ.get("NOTIFY_FIELDS", "[]")
         GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-        PASS_THRESHOLD = int(os.environ.get("PASS_THRESHOLD", "90"))
+        PASS_THRESHOLD = int(os.environ.get("PASS_THRESHOLD", "80"))
         MAX_PAGES = int(os.environ.get("MAX_PAGES", "1"))
         MAX_API_USAGE = int(os.environ.get("MAX_API_USAGE", "1000"))
         RESET_HOUR_UTC = int(os.environ.get("RESET_HOUR_UTC", "0"))
