@@ -1631,7 +1631,7 @@ def main():
             {"label": "提案文（初稿）", "key": "proposal_text_draft"},
             {"label": "リスクスコア", "key": "risk_score"},
             {"label": "リスク所見", "key": "risk_findings"},
-            {"label": "修正指示（5-A）", "key": "risk_revision_guidance"},
+            {"label": "修正指示（5-A・発注者向け）", "key": "risk_revision_guidance"},
             {"label": "備考（5-A・修正に使わない）", "key": "risk_advisory_notes"},
             {"label": "受注期待度", "key": "reception_score"},
             {"label": "発注者の背景", "key": "buyer_pain_point"},
