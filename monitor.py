@@ -133,6 +133,10 @@ _SLACK_LIMIT_LONG = 800
 _SLACK_LIMIT_DEFAULT = 500
 _SLACK_LONG_TEXT_KEYS = frozenset({
     "risk_findings",
+    "risk_revision_guidance",
+    "risk_advisory_notes",
+    "revision_guidance",
+    "advisory_notes",
     "final_risk_findings",
     "credibility_good",
     "credibility_bad",
@@ -155,7 +159,7 @@ _PM_REVIEW_INPUT_KEYS = (
 _BUYER_REVIEW_KEYS = ("id", "title", "description", "meta1", "proposal_text")
 _REVISION_INPUT_KEYS = (
     "id", "title", "description", "meta1", "delivery_text", "proposal_text",
-    "risk_findings", "buyer_pain_point", "credibility_bad",
+    "risk_revision_guidance", "revision_guidance",
 )
 _PHASE7A_INPUT_KEYS = (
     "id", "title", "description", "meta1", "work_estimate", "delivery_text",
@@ -185,11 +189,23 @@ def _format_slack_field_value(key, value, entry, url_template):
 
 
 def _url_by_id_from_items(items):
-    return {
-        str(item["id"]): item["url"]
-        for item in items
-        if isinstance(item, dict) and item.get("id") and item.get("url")
-    }
+    out = {}
+    for item in items:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        url = item.get("url")
+        if url and not _url_value_needs_fixup(url):
+            out[str(item["id"])] = url
+    return out
+
+
+def _url_value_needs_fixup(value):
+    if not value or not isinstance(value, str):
+        return True
+    s = value.strip()
+    if s.startswith("http://") or s.startswith("https://"):
+        return False
+    return True
 
 
 def _enrich_items_urls(items, url_by_id, url_template):
@@ -198,13 +214,25 @@ def _enrich_items_urls(items, url_by_id, url_template):
     for item in items:
         if not isinstance(item, dict):
             continue
-        if item.get("url"):
+        url = item.get("url")
+        if url and not _url_value_needs_fixup(url):
             continue
         item_id = str(item.get("id", ""))
         if item_id and item_id in url_by_id:
             item["url"] = url_by_id[item_id]
         elif item_id and url_template:
             item["url"] = url_template.replace("{id}", item_id)
+
+
+def _format_final_reception_summary(items):
+    parts = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        score = item.get("final_reception_score")
+        if isinstance(score, (int, float)):
+            parts.append(f"{item.get('id', '?')}={int(score)}")
+    return ", ".join(parts) if parts else None
 
 
 def _format_ai_sample(items, sample_max, prefer_keys=None, url_template=None):
@@ -310,10 +338,14 @@ def format_run_summary(exit_reason, **ctx):
         lines.extend([
             "Phase5 (final):",
             f"  results: {ctx['phase5_total']}",
-            f"  notified (pass=true, score>={ctx.get('pass_threshold', '?')}): "
+            f"  notified (phase4 pass + safety_score>={ctx.get('pass_threshold', '?')}): "
             f"{ctx.get('notified_count', 0)}",
-            "",
         ])
+        if ctx.get("final_reception_summary"):
+            lines.append(
+                f"  final_reception_score (7-B): {ctx['final_reception_summary']}",
+            )
+        lines.append("")
     partial = ctx.get("partial_result")
     sample_max = ctx.get("sample_max", 5)
     if partial:
@@ -1599,10 +1631,14 @@ def main():
             {"label": "提案文（初稿）", "key": "proposal_text_draft"},
             {"label": "リスクスコア", "key": "risk_score"},
             {"label": "リスク所見", "key": "risk_findings"},
+            {"label": "修正指示（5-A）", "key": "risk_revision_guidance"},
+            {"label": "備考（5-A・修正に使わない）", "key": "risk_advisory_notes"},
             {"label": "受注期待度", "key": "reception_score"},
             {"label": "発注者の背景", "key": "buyer_pain_point"},
             {"label": "信頼できる点", "key": "credibility_good"},
             {"label": "不安要素", "key": "credibility_bad"},
+            {"label": "修正指示（5-B）", "key": "revision_guidance"},
+            {"label": "備考（5-B・修正に使わない）", "key": "advisory_notes"},
         ]
         _notify_phase6_fields = [
             {"label": "タイトル", "key": "title"},
@@ -1622,6 +1658,7 @@ def main():
         ]
 
         if PROMPT_PHASE5:
+            url_by_id = {**url_by_id, **_url_by_id_from_items(passed4)}
             phase5_fields = _parse_csv_fields(PHASE5_FIELDS)
             proposal_input = _build_slim_list(passed4, _PROPOSAL_INPUT_KEYS)
 
@@ -1636,7 +1673,9 @@ def main():
             last_gemini_raw = raw
             gemini_calls += 1
             result5_draft = validate_json_list(raw, phase5_fields, current_phase)
+            _enrich_items_urls(result5_draft, url_by_id, NOTIFY_URL_TEMPLATE)
             result5_merged = merge_items_by_id(passed4, result5_draft)
+            url_by_id = {**url_by_id, **_url_by_id_from_items(result5_merged)}
             phase5_draft_count = len(result5_merged)
             partial_result = result5_merged
 
@@ -1680,6 +1719,7 @@ def main():
             for item in result5:
                 if isinstance(item, dict) and item.get("proposal_text"):
                     item["proposal_text_draft"] = item["proposal_text"]
+            _enrich_items_urls(result5, url_by_id, NOTIFY_URL_TEMPLATE)
 
             if NOTIFY_PHASE5_DRAFT_REVIEW_HEADER:
                 draft_bodies = _format_notify_entries(
@@ -1709,8 +1749,10 @@ def main():
                 last_gemini_raw = raw
                 gemini_calls += 1
                 result6_list = validate_json_list(raw, phase6_fields, current_phase)
+                _enrich_items_urls(result6_list, url_by_id, NOTIFY_URL_TEMPLATE)
                 phase6_count = len(result6_list)
                 result5 = merge_items_by_id(result5, result6_list)
+                _enrich_items_urls(result5, url_by_id, NOTIFY_URL_TEMPLATE)
                 for item in result5:
                     if isinstance(item, dict) and not item.get("proposal_text_draft"):
                         item["proposal_text_draft"] = item.get("proposal_text", "")
@@ -1812,6 +1854,7 @@ def main():
                 continue
             notified_count += 1
 
+        final_reception_summary = _format_final_reception_summary(result5)
         summary_body = format_run_summary(
             "success" if notified_count > 0 else "below_threshold",
             phase1_diag=phase1_diag,
@@ -1827,6 +1870,7 @@ def main():
             phase7b=phase7b_count if PROMPT_PHASE7_REVIEW_B else None,
             phase5_total=len(result5),
             notified_count=notified_count,
+            final_reception_summary=final_reception_summary,
             pass_threshold=PASS_THRESHOLD,
             partial_result=result5 if notified_count == 0 else None,
             seen_before=seen_ids_before,
