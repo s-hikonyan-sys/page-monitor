@@ -6,6 +6,15 @@ on:
     - cron: '0 5 * * *'  # 毎日 JST 14:00 (UTC 05:00)
     - cron: '0 9 * * *'  # 毎日 JST 18:00 (UTC 09:00)
   workflow_dispatch:
+    inputs:
+      persist_state:
+        description: 'seen_ids / api_state をリポジトリにコミットする'
+        type: boolean
+        default: false
+      ignore_seen_ids:
+        description: 'seen_ids を無視し全スクレイプ件を新規扱い（手動テスト用）'
+        type: boolean
+        default: false
 
 jobs:
   check-and-notify:
@@ -77,10 +86,12 @@ jobs:
           MAX_API_USAGE: ${{ vars.MAX_API_USAGE }}
           RESET_HOUR_UTC: ${{ vars.RESET_HOUR_UTC }}
           GEMINI_429_RETRY_SEC: ${{ vars.GEMINI_429_RETRY_SEC }}
+          SKIP_SEEN_IDS_SAVE: ${{ github.event_name == 'workflow_dispatch' && !inputs.persist_state && '1' || '' }}
+          IGNORE_SEEN_IDS: ${{ github.event_name == 'workflow_dispatch' && inputs.ignore_seen_ids && '1' || '' }}
         run: python monitor.py
 
       - name: Commit and Push State
-        if: always()
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.persist_state == true))
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"

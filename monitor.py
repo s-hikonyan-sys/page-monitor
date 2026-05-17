@@ -359,6 +359,27 @@ def save_seen_ids(seen_ids):
             f.write(f"{item_id}\n")
 
 
+def _env_flag_true(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def _persist_seen_ids_enabled():
+    return not _env_flag_true("SKIP_SEEN_IDS_SAVE")
+
+
+def _maybe_save_seen_ids(seen_ids):
+    if _persist_seen_ids_enabled():
+        save_seen_ids(seen_ids)
+        return True
+    return False
+
+
+def load_seen_ids_for_run():
+    if _env_flag_true("IGNORE_SEEN_IDS"):
+        return set()
+    return load_seen_ids()
+
+
 def load_api_state():
     if os.path.exists(API_STATE_FILE):
         with open(API_STATE_FILE, "r") as f:
@@ -1339,7 +1360,7 @@ def main():
         RESET_HOUR_UTC = int(os.environ.get("RESET_HOUR_UTC", "0"))
         NOTIFY_SUMMARY_SAMPLE_MAX = int(os.environ.get("NOTIFY_SUMMARY_SAMPLE_MAX", "5"))
         gemini_calls = 0
-        seen_ids = load_seen_ids()
+        seen_ids = load_seen_ids_for_run()
         seen_ids_before = len(seen_ids)
 
         if not all([TARGET_URL, KEYS_STR, SLACK_WEBHOOK_URL, AI_PROMPT, PARSE_CONFIG]):
@@ -1418,7 +1439,7 @@ def main():
         if len(seen_ids) == 0:
             for item in new_items:
                 seen_ids.add(item["id"])
-            save_seen_ids(seen_ids)
+            seen_saved = _maybe_save_seen_ids(seen_ids)
             finish_run(
                 SLACK_WEBHOOK_URL,
                 NOTIFY_SEED_HEADER,
@@ -1427,7 +1448,7 @@ def main():
                     phase1_diag=phase1_diag,
                     seen_before=0,
                     seen_after=len(seen_ids),
-                    seen_saved=True,
+                    seen_saved=seen_saved,
                     gemini_calls=gemini_calls,
                     sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
                 ) + "\n\n" + format_phase1_seed(phase1_diag, len(new_items)),
@@ -1451,7 +1472,7 @@ def main():
             if not passed2:
                 for item in new_items:
                     seen_ids.add(item["id"])
-                save_seen_ids(seen_ids)
+                seen_saved = _maybe_save_seen_ids(seen_ids)
                 finish_run(
                     SLACK_WEBHOOK_URL,
                     NOTIFY_PHASE2_REJECTED_HEADER,
@@ -1464,7 +1485,7 @@ def main():
                         partial_result=result2,
                         seen_before=seen_ids_before,
                         seen_after=len(seen_ids),
-                        seen_saved=True,
+                        seen_saved=seen_saved,
                         gemini_calls=gemini_calls,
                         sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
                         url_template=NOTIFY_URL_TEMPLATE,
@@ -1518,7 +1539,7 @@ def main():
             if not passed4:
                 for item in new_items:
                     seen_ids.add(item["id"])
-                save_seen_ids(seen_ids)
+                seen_saved = _maybe_save_seen_ids(seen_ids)
                 finish_run(
                     SLACK_WEBHOOK_URL,
                     NOTIFY_PHASE4_REJECTED_HEADER,
@@ -1533,7 +1554,7 @@ def main():
                         partial_result=result4,
                         seen_before=seen_ids_before,
                         seen_after=len(seen_ids),
-                        seen_saved=True,
+                        seen_saved=seen_saved,
                         gemini_calls=gemini_calls,
                         sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
                         sample_keys=(
@@ -1755,7 +1776,7 @@ def main():
 
         for item in new_items:
             seen_ids.add(item["id"])
-        save_seen_ids(seen_ids)
+        seen_saved = _maybe_save_seen_ids(seen_ids)
         seen_ids_after = len(seen_ids)
 
         if not result5:
@@ -1770,7 +1791,7 @@ def main():
                     phase5_total=0,
                     seen_before=seen_ids_before,
                     seen_after=seen_ids_after,
-                    seen_saved=True,
+                    seen_saved=seen_saved,
                     gemini_calls=gemini_calls,
                     sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
                     url_template=NOTIFY_URL_TEMPLATE,
@@ -1778,9 +1799,6 @@ def main():
                 ),
             )
 
-        blocks = [
-            {"type": "header", "text": {"type": "plain_text", "text": NOTIFY_HEADER}},
-        ]
         notified_count = 0
         for entry in result5:
             if entry.get(notify_pass_field) is not True:
@@ -1789,23 +1807,9 @@ def main():
             if not isinstance(score, (int, float)) or score < PASS_THRESHOLD:
                 continue
             notified_count += 1
-            lines = []
-            for nf in notify_fields:
-                label = nf.get("label", nf.get("key", ""))
-                key = nf.get("key", "")
-                value = entry.get(key, "")
-                if value:
-                    text = _format_slack_field_value(
-                        key, value, entry, NOTIFY_URL_TEMPLATE,
-                    )
-                    lines.append(f"*{label}:* {text}")
-            text_body = "\n".join(lines)
-            if text_body:
-                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text_body}})
-                blocks.append({"type": "divider"})
 
         summary_body = format_run_summary(
-            "success" if len(blocks) > 1 else "below_threshold",
+            "success" if notified_count > 0 else "below_threshold",
             phase1_diag=phase1_diag,
             phase2_input=len(new_items),
             phase2_passed=len(passed2) if PROMPT_PHASE2 else len(new_items),
@@ -1820,10 +1824,10 @@ def main():
             phase5_total=len(result5),
             notified_count=notified_count,
             pass_threshold=PASS_THRESHOLD,
-            partial_result=result5 if len(blocks) <= 1 else None,
+            partial_result=result5 if notified_count == 0 else None,
             seen_before=seen_ids_before,
             seen_after=seen_ids_after,
-            seen_saved=True,
+            seen_saved=seen_saved,
             gemini_calls=gemini_calls,
             sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
             sample_keys=("id", "score", "pass", "reason"),
@@ -1831,12 +1835,9 @@ def main():
             url_by_id=url_by_id,
         )
 
-        if len(blocks) > 1:
-            requests.post(SLACK_WEBHOOK_URL, json={"blocks": blocks}, timeout=10)
-            if NOTIFY_SUCCESS_SUMMARY_HEADER:
-                send_info_to_slack(
-                    SLACK_WEBHOOK_URL, NOTIFY_SUCCESS_SUMMARY_HEADER, summary_body,
-                )
+        if notified_count > 0:
+            header = NOTIFY_SUCCESS_SUMMARY_HEADER or "Run complete"
+            send_info_to_slack(SLACK_WEBHOOK_URL, header, summary_body)
         else:
             finish_run(
                 SLACK_WEBHOOK_URL, NOTIFY_BELOW_THRESHOLD_HEADER, summary_body,
