@@ -34,6 +34,8 @@ jobs:
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           AI_PROMPT: ${{ secrets.AI_PROMPT }}
+          AI_PROMPT_PROPOSAL: ${{ secrets.AI_PROMPT_PROPOSAL }}
+          AI_PROMPT_PM: ${{ secrets.AI_PROMPT_PM }}
           PARSE_CONFIG: ${{ secrets.PARSE_CONFIG }}
           DETAIL_CONFIG: ${{ secrets.DETAIL_CONFIG }}
           PROMPT_PHASE2: ${{ secrets.PROMPT_PHASE2 }}
@@ -42,13 +44,20 @@ jobs:
           PROMPT_PHASE5_REVIEW_A: ${{ secrets.PROMPT_PHASE5_REVIEW_A }}
           PROMPT_PHASE5_REVIEW_B: ${{ secrets.PROMPT_PHASE5_REVIEW_B }}
           PROMPT_PHASE6_REVISION: ${{ secrets.PROMPT_PHASE6_REVISION }}
+          PROMPT_PHASE7_REVIEW_A: ${{ secrets.PROMPT_PHASE7_REVIEW_A }}
+          PROMPT_PHASE7_REVIEW_B: ${{ secrets.PROMPT_PHASE7_REVIEW_B }}
           PHASE2_FIELDS: ${{ secrets.PHASE2_FIELDS }}
           PHASE4_FIELDS: ${{ secrets.PHASE4_FIELDS }}
           PHASE5_FIELDS: ${{ secrets.PHASE5_FIELDS }}
           PHASE5_REVIEW_A_FIELDS: ${{ secrets.PHASE5_REVIEW_A_FIELDS }}
           PHASE5_REVIEW_B_FIELDS: ${{ secrets.PHASE5_REVIEW_B_FIELDS }}
           PHASE6_FIELDS: ${{ secrets.PHASE6_FIELDS }}
+          PHASE7_REVIEW_A_FIELDS: ${{ secrets.PHASE7_REVIEW_A_FIELDS }}
+          PHASE7_REVIEW_B_FIELDS: ${{ secrets.PHASE7_REVIEW_B_FIELDS }}
           NOTIFY_PHASE4_PASSED_HEADER: ${{ secrets.NOTIFY_PHASE4_PASSED_HEADER }}
+          NOTIFY_PHASE5_DRAFT_REVIEW_HEADER: ${{ secrets.NOTIFY_PHASE5_DRAFT_REVIEW_HEADER }}
+          NOTIFY_PHASE6_HEADER: ${{ secrets.NOTIFY_PHASE6_HEADER }}
+          NOTIFY_PHASE7_HEADER: ${{ secrets.NOTIFY_PHASE7_HEADER }}
           PHASE2_PASS_FIELD: ${{ secrets.PHASE2_PASS_FIELD }}
           PHASE4_PASS_FIELD: ${{ secrets.PHASE4_PASS_FIELD }}
           NOTIFY_HEADER: ${{ secrets.NOTIFY_HEADER }}

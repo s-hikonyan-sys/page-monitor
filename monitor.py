@@ -133,13 +133,36 @@ _SLACK_LIMIT_LONG = 800
 _SLACK_LIMIT_DEFAULT = 500
 _SLACK_LONG_TEXT_KEYS = frozenset({
     "risk_findings",
+    "final_risk_findings",
     "credibility_good",
     "credibility_bad",
+    "final_credibility_good",
+    "final_credibility_bad",
     "buyer_pain_point",
+    "final_buyer_pain_point",
     "technical_requirements",
     "implementation_challenges",
     "proposed_solutions_to_implementation_challenges",
 })
+
+_PROPOSAL_INPUT_KEYS = (
+    "id", "title", "url", "description", "meta1", "work_estimate", "delivery_text",
+)
+_PM_REVIEW_INPUT_KEYS = (
+    "id", "title", "url", "description", "meta1", "work_estimate", "delivery_text",
+    "proposal_text", "technical_requirements", "implementation_challenges",
+    "proposed_solutions_to_implementation_challenges",
+)
+_BUYER_REVIEW_KEYS = ("id", "title", "url", "description", "meta1", "proposal_text")
+_REVISION_INPUT_KEYS = (
+    "id", "title", "url", "description", "meta1", "delivery_text", "proposal_text",
+    "risk_score", "risk_findings", "reception_score", "buyer_pain_point",
+    "credibility_good", "credibility_bad",
+)
+_PHASE7A_INPUT_KEYS = (
+    "id", "title", "url", "description", "meta1", "work_estimate", "delivery_text",
+    "proposal_text",
+)
 
 
 def _format_slack_field_value(key, value, entry, url_template):
@@ -152,7 +175,7 @@ def _format_slack_field_value(key, value, entry, url_template):
         text = json.dumps(value, ensure_ascii=False)
     else:
         text = str(value)
-    if key == "proposal_text":
+    if key in ("proposal_text", "proposal_text_draft"):
         limit = _SLACK_LIMIT_PROPOSAL
     elif key in _SLACK_LONG_TEXT_KEYS:
         limit = _SLACK_LIMIT_LONG
@@ -271,6 +294,18 @@ def format_run_summary(exit_reason, **ctx):
         lines.extend([
             "Phase6 (revision):",
             f"  items: {ctx['phase6']}",
+            "",
+        ])
+    if ctx.get("phase7a") is not None:
+        lines.extend([
+            "Phase7-A (final risk):",
+            f"  items: {ctx['phase7a']}",
+            "",
+        ])
+    if ctx.get("phase7b") is not None:
+        lines.extend([
+            "Phase7-B (final buyer):",
+            f"  items: {ctx['phase7b']}",
             "",
         ])
     if "phase5_total" in ctx:
@@ -523,7 +558,68 @@ def merge_items_by_id(*item_lists):
 
 
 def build_phase_prompt(base_prompt, phase_prompt, data):
-    return f"{base_prompt}\n\n{phase_prompt}\n\n{json.dumps(data, ensure_ascii=False)}"
+    parts = [p.strip() for p in (base_prompt or "", phase_prompt or "") if p and p.strip()]
+    body = "\n\n".join(parts)
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"{body}\n\n{payload}" if body else payload
+
+
+def _pick_item_fields(item, keys, proposal_key=None):
+    if not isinstance(item, dict):
+        return {}
+    out = {}
+    for key in keys:
+        if key == "proposal_text" and proposal_key:
+            val = item.get(proposal_key) or item.get("proposal_text")
+        else:
+            val = item.get(key)
+        if val is not None and val != "":
+            out[key] = val
+    if "id" in item:
+        out["id"] = item["id"]
+    return out
+
+
+def _build_slim_list(items, keys, proposal_key=None):
+    return [
+        slim
+        for item in items
+        if isinstance(item, dict)
+        for slim in [_pick_item_fields(item, keys, proposal_key)]
+        if slim.get("id")
+    ]
+
+
+def _format_notify_entries(items, notify_field_specs, url_template, pass_field=None, pass_threshold=None):
+    blocks_body = []
+    for entry in items:
+        if pass_field and entry.get(pass_field) is not True:
+            continue
+        if pass_threshold is not None:
+            score = entry.get("score", entry.get("safety_score", 0))
+            if not isinstance(score, (int, float)) or score < pass_threshold:
+                continue
+        lines = []
+        for nf in notify_field_specs:
+            label = nf.get("label", nf.get("key", ""))
+            key = nf.get("key", "")
+            value = entry.get(key, "")
+            if value:
+                text = _format_slack_field_value(key, value, entry, url_template)
+                lines.append(f"*{label}:* {text}")
+        if lines:
+            blocks_body.append("\n".join(lines))
+    return blocks_body
+
+
+def _send_notify_blocks(webhook_url, header, entries_text_list):
+    if not webhook_url or not entries_text_list:
+        return
+    blocks = [{"type": "header", "text": {"type": "plain_text", "text": header[:150]}}]
+    for text_body in entries_text_list:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text_body}})
+        blocks.append({"type": "divider"})
+    requests.post(webhook_url, json={"blocks": blocks}, timeout=10)
 
 
 def _parse_csv_fields(fields_str):
@@ -551,6 +647,9 @@ def _format_phase4_passed_slack(passed4, url_template, sample_max=3):
         lines.append(f"- {head} safety={safety}")
         if we_text:
             lines.append(f"  work_estimate: {we_text}")
+        dt = item.get("delivery_text")
+        if dt:
+            lines.append(f"  delivery_text: {str(dt)[:120]}")
         if reason:
             lines.append(f"  reason: {reason}")
     remaining = len(ranked) - sample_max
@@ -1188,6 +1287,8 @@ def main():
         TARGET_URL = os.environ.get("TARGET_URL")
         KEYS_STR = os.environ.get("GEMINI_API_KEYS")
         AI_PROMPT = os.environ.get("AI_PROMPT")
+        AI_PROMPT_PROPOSAL = os.environ.get("AI_PROMPT_PROPOSAL", "")
+        AI_PROMPT_PM = os.environ.get("AI_PROMPT_PM", "")
         PARSE_CONFIG = os.environ.get("PARSE_CONFIG")
         DETAIL_CONFIG = os.environ.get("DETAIL_CONFIG")
         PROMPT_PHASE2 = os.environ.get("PROMPT_PHASE2")
@@ -1196,13 +1297,22 @@ def main():
         PROMPT_PHASE5_REVIEW_A = os.environ.get("PROMPT_PHASE5_REVIEW_A")
         PROMPT_PHASE5_REVIEW_B = os.environ.get("PROMPT_PHASE5_REVIEW_B")
         PROMPT_PHASE6_REVISION = os.environ.get("PROMPT_PHASE6_REVISION")
+        PROMPT_PHASE7_REVIEW_A = os.environ.get("PROMPT_PHASE7_REVIEW_A")
+        PROMPT_PHASE7_REVIEW_B = os.environ.get("PROMPT_PHASE7_REVIEW_B")
         PHASE2_FIELDS = os.environ.get("PHASE2_FIELDS", "")
         PHASE4_FIELDS = os.environ.get("PHASE4_FIELDS", "")
         PHASE5_FIELDS = os.environ.get("PHASE5_FIELDS", "")
         PHASE5_REVIEW_A_FIELDS = os.environ.get("PHASE5_REVIEW_A_FIELDS", "")
         PHASE5_REVIEW_B_FIELDS = os.environ.get("PHASE5_REVIEW_B_FIELDS", "")
         PHASE6_FIELDS = os.environ.get("PHASE6_FIELDS", "")
+        PHASE7_REVIEW_A_FIELDS = os.environ.get("PHASE7_REVIEW_A_FIELDS", "")
+        PHASE7_REVIEW_B_FIELDS = os.environ.get("PHASE7_REVIEW_B_FIELDS", "")
         NOTIFY_PHASE4_PASSED_HEADER = os.environ.get("NOTIFY_PHASE4_PASSED_HEADER", "")
+        NOTIFY_PHASE5_DRAFT_REVIEW_HEADER = os.environ.get(
+            "NOTIFY_PHASE5_DRAFT_REVIEW_HEADER", "",
+        )
+        NOTIFY_PHASE6_HEADER = os.environ.get("NOTIFY_PHASE6_HEADER", "")
+        NOTIFY_PHASE7_HEADER = os.environ.get("NOTIFY_PHASE7_HEADER", "")
         PHASE2_PASS_FIELD = os.environ.get("PHASE2_PASS_FIELD", "pass")
         PHASE4_PASS_FIELD = os.environ.get("PHASE4_PASS_FIELD", "pass")
         NOTIFY_HEADER = os.environ.get("NOTIFY_HEADER", "New results")
@@ -1234,6 +1344,18 @@ def main():
 
         if not all([TARGET_URL, KEYS_STR, SLACK_WEBHOOK_URL, AI_PROMPT, PARSE_CONFIG]):
             raise ValueError("Required environment variables are not configured.")
+        if PROMPT_PHASE5 and not AI_PROMPT_PROPOSAL:
+            raise ValueError(
+                "AI_PROMPT_PROPOSAL is required when PROMPT_PHASE5 is configured.",
+            )
+        if PROMPT_PHASE5_REVIEW_A and not AI_PROMPT_PM:
+            raise ValueError(
+                "AI_PROMPT_PM is required when PROMPT_PHASE5_REVIEW_A is configured.",
+            )
+        if PROMPT_PHASE7_REVIEW_A and not AI_PROMPT_PM:
+            raise ValueError(
+                "AI_PROMPT_PM is required when PROMPT_PHASE7_REVIEW_A is configured.",
+            )
 
         parse_cfg = json.loads(PARSE_CONFIG)
         notify_fields = json.loads(NOTIFY_FIELDS)
@@ -1443,21 +1565,53 @@ def main():
         phase5a_count = 0
         phase5b_count = 0
         phase6_count = 0
+        phase7a_count = 0
+        phase7b_count = 0
+
+        _notify_draft_review_fields = [
+            {"label": "タイトル", "key": "title"},
+            {"label": "URL", "key": "url"},
+            {"label": "提案文（初稿）", "key": "proposal_text_draft"},
+            {"label": "リスクスコア", "key": "risk_score"},
+            {"label": "リスク所見", "key": "risk_findings"},
+            {"label": "受注期待度", "key": "reception_score"},
+            {"label": "発注者の背景", "key": "buyer_pain_point"},
+            {"label": "信頼できる点", "key": "credibility_good"},
+            {"label": "不安要素", "key": "credibility_bad"},
+        ]
+        _notify_phase6_fields = [
+            {"label": "タイトル", "key": "title"},
+            {"label": "URL", "key": "url"},
+            {"label": "提案文（修正後）", "key": "proposal_text"},
+        ]
+        _notify_phase7_fields = [
+            {"label": "タイトル", "key": "title"},
+            {"label": "URL", "key": "url"},
+            {"label": "提案文（修正後）", "key": "proposal_text"},
+            {"label": "最終リスクスコア", "key": "final_risk_score"},
+            {"label": "最終リスク所見", "key": "final_risk_findings"},
+            {"label": "最終受注期待度", "key": "final_reception_score"},
+            {"label": "最終・発注者背景", "key": "final_buyer_pain_point"},
+            {"label": "最終・信頼できる点", "key": "final_credibility_good"},
+            {"label": "最終・不安要素", "key": "final_credibility_bad"},
+        ]
 
         if PROMPT_PHASE5:
-            phase5_input = passed4
             phase5_fields = _parse_csv_fields(PHASE5_FIELDS)
+            proposal_input = _build_slim_list(passed4, _PROPOSAL_INPUT_KEYS)
 
             current_phase = "phase5-draft"
             raw = call_gemini(
                 KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
-                build_phase_prompt(AI_PROMPT, PROMPT_PHASE5, phase5_input),
+                build_phase_prompt(
+                    AI_PROMPT_PROPOSAL, PROMPT_PHASE5, proposal_input,
+                ),
                 GEMINI_MODEL,
             )
             last_gemini_raw = raw
             gemini_calls += 1
             result5_draft = validate_json_list(raw, phase5_fields, current_phase)
-            result5_merged = merge_items_by_id(phase5_input, result5_draft)
+            result5_merged = merge_items_by_id(passed4, result5_draft)
             phase5_draft_count = len(result5_merged)
             partial_result = result5_merged
 
@@ -1465,10 +1619,11 @@ def main():
             if PROMPT_PHASE5_REVIEW_A:
                 current_phase = "phase5-a"
                 review_a_fields = _parse_csv_fields(PHASE5_REVIEW_A_FIELDS)
+                pm_input = _build_slim_list(result5_merged, _PM_REVIEW_INPUT_KEYS)
                 raw = call_gemini(
                     KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
                     build_phase_prompt(
-                        AI_PROMPT, PROMPT_PHASE5_REVIEW_A, result5_merged,
+                        AI_PROMPT_PM, PROMPT_PHASE5_REVIEW_A, pm_input,
                     ),
                     GEMINI_MODEL,
                 )
@@ -1481,11 +1636,10 @@ def main():
             if PROMPT_PHASE5_REVIEW_B:
                 current_phase = "phase5-b"
                 review_b_fields = _parse_csv_fields(PHASE5_REVIEW_B_FIELDS)
+                buyer_input = _build_slim_list(result5_merged, _BUYER_REVIEW_KEYS)
                 raw = call_gemini(
                     KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
-                    build_phase_prompt(
-                        AI_PROMPT, PROMPT_PHASE5_REVIEW_B, result5_merged,
-                    ),
+                    build_phase_prompt("", PROMPT_PHASE5_REVIEW_B, buyer_input),
                     GEMINI_MODEL,
                 )
                 last_gemini_raw = raw
@@ -1498,13 +1652,33 @@ def main():
                 result5a_list,
                 result5b_list,
             )
+            for item in result5:
+                if isinstance(item, dict) and item.get("proposal_text"):
+                    item["proposal_text_draft"] = item["proposal_text"]
+
+            if NOTIFY_PHASE5_DRAFT_REVIEW_HEADER:
+                draft_bodies = _format_notify_entries(
+                    result5,
+                    _notify_draft_review_fields,
+                    NOTIFY_URL_TEMPLATE,
+                    notify_pass_field,
+                    PASS_THRESHOLD,
+                )
+                _send_notify_blocks(
+                    SLACK_WEBHOOK_URL,
+                    NOTIFY_PHASE5_DRAFT_REVIEW_HEADER,
+                    draft_bodies,
+                )
 
             if PROMPT_PHASE6_REVISION:
                 current_phase = "phase6"
                 phase6_fields = _parse_csv_fields(PHASE6_FIELDS)
+                revision_input = _build_slim_list(result5, _REVISION_INPUT_KEYS)
                 raw = call_gemini(
                     KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
-                    build_phase_prompt(AI_PROMPT, PROMPT_PHASE6_REVISION, result5),
+                    build_phase_prompt(
+                        AI_PROMPT_PROPOSAL, PROMPT_PHASE6_REVISION, revision_input,
+                    ),
                     GEMINI_MODEL,
                 )
                 last_gemini_raw = raw
@@ -1512,6 +1686,68 @@ def main():
                 result6_list = validate_json_list(raw, phase6_fields, current_phase)
                 phase6_count = len(result6_list)
                 result5 = merge_items_by_id(result5, result6_list)
+                for item in result5:
+                    if isinstance(item, dict) and not item.get("proposal_text_draft"):
+                        item["proposal_text_draft"] = item.get("proposal_text", "")
+
+                if NOTIFY_PHASE6_HEADER:
+                    phase6_bodies = _format_notify_entries(
+                        result5,
+                        _notify_phase6_fields,
+                        NOTIFY_URL_TEMPLATE,
+                        notify_pass_field,
+                        PASS_THRESHOLD,
+                    )
+                    _send_notify_blocks(
+                        SLACK_WEBHOOK_URL, NOTIFY_PHASE6_HEADER, phase6_bodies,
+                    )
+
+            result7a_list = []
+            if PROMPT_PHASE7_REVIEW_A:
+                current_phase = "phase7-a"
+                phase7a_fields = _parse_csv_fields(PHASE7_REVIEW_A_FIELDS)
+                phase7a_input = _build_slim_list(result5, _PHASE7A_INPUT_KEYS)
+                raw = call_gemini(
+                    KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
+                    build_phase_prompt(
+                        AI_PROMPT_PM, PROMPT_PHASE7_REVIEW_A, phase7a_input,
+                    ),
+                    GEMINI_MODEL,
+                )
+                last_gemini_raw = raw
+                gemini_calls += 1
+                result7a_list = validate_json_list(raw, phase7a_fields, current_phase)
+                phase7a_count = len(result7a_list)
+
+            result7b_list = []
+            if PROMPT_PHASE7_REVIEW_B:
+                current_phase = "phase7-b"
+                phase7b_fields = _parse_csv_fields(PHASE7_REVIEW_B_FIELDS)
+                buyer7_input = _build_slim_list(result5, _BUYER_REVIEW_KEYS)
+                raw = call_gemini(
+                    KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
+                    build_phase_prompt("", PROMPT_PHASE7_REVIEW_B, buyer7_input),
+                    GEMINI_MODEL,
+                )
+                last_gemini_raw = raw
+                gemini_calls += 1
+                result7b_list = validate_json_list(raw, phase7b_fields, current_phase)
+                phase7b_count = len(result7b_list)
+
+            if result7a_list or result7b_list:
+                result5 = merge_items_by_id(result5, result7a_list, result7b_list)
+
+            if NOTIFY_PHASE7_HEADER and (result7a_list or result7b_list):
+                phase7_bodies = _format_notify_entries(
+                    result5,
+                    _notify_phase7_fields,
+                    NOTIFY_URL_TEMPLATE,
+                    notify_pass_field,
+                    PASS_THRESHOLD,
+                )
+                _send_notify_blocks(
+                    SLACK_WEBHOOK_URL, NOTIFY_PHASE7_HEADER, phase7_bodies,
+                )
 
             partial_result = result5
         else:
@@ -1579,6 +1815,8 @@ def main():
             phase5a=phase5a_count if PROMPT_PHASE5_REVIEW_A else None,
             phase5b=phase5b_count if PROMPT_PHASE5_REVIEW_B else None,
             phase6=phase6_count if PROMPT_PHASE6_REVISION else None,
+            phase7a=phase7a_count if PROMPT_PHASE7_REVIEW_A else None,
+            phase7b=phase7b_count if PROMPT_PHASE7_REVIEW_B else None,
             phase5_total=len(result5),
             notified_count=notified_count,
             pass_threshold=PASS_THRESHOLD,
