@@ -135,8 +135,9 @@ def _format_slack_field_value(key, value, entry, url_template):
             label = entry.get("id", value) if key == "url" else value
             return _slack_link(link_url, label)
     text = str(value)
-    if len(text) > 500:
-        text = text[:500] + "...(truncated)"
+    limit = 1200 if key == "proposal_text" else 500
+    if len(text) > limit:
+        text = text[:limit] + "...(truncated)"
     return text
 
 
