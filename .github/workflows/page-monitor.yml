@@ -12,7 +12,7 @@ on:
         type: boolean
         default: false
       ignore_seen_ids:
-        description: 'seen_ids を無視し全スクレイプ件を新規扱い（手動テスト用）'
+        description: 'seen_ids を無視し全スクレイプ件を新規扱いで Phase2〜7 まで実行（seed はスキップ・手動テスト用）'
         type: boolean
         default: false
 

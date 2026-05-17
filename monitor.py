@@ -372,10 +372,15 @@ def _maybe_save_seen_ids(seen_ids):
     return False
 
 
-def load_seen_ids_for_run():
-    if _env_flag_true("IGNORE_SEEN_IDS"):
-        return set()
-    return load_seen_ids()
+def _ignore_seen_ids():
+    return _env_flag_true("IGNORE_SEEN_IDS")
+
+
+def _is_initial_seed_run():
+    """初回 seed は state ファイルが空のときのみ。IGNORE_SEEN_IDS 時は seed せずパイプライン続行。"""
+    if _ignore_seen_ids():
+        return False
+    return len(load_seen_ids()) == 0
 
 
 def load_api_state():
@@ -1358,8 +1363,9 @@ def main():
         RESET_HOUR_UTC = int(os.environ.get("RESET_HOUR_UTC", "0"))
         NOTIFY_SUMMARY_SAMPLE_MAX = int(os.environ.get("NOTIFY_SUMMARY_SAMPLE_MAX", "5"))
         gemini_calls = 0
-        seen_ids = load_seen_ids_for_run()
-        seen_ids_before = len(seen_ids)
+        seen_ids_on_disk = load_seen_ids()
+        seen_ids_before = len(seen_ids_on_disk)
+        seen_ids = set() if _ignore_seen_ids() else seen_ids_on_disk
 
         if not all([TARGET_URL, KEYS_STR, SLACK_WEBHOOK_URL, AI_PROMPT, PARSE_CONFIG]):
             raise ValueError("Required environment variables are not configured.")
@@ -1434,7 +1440,7 @@ def main():
                 ) + "\n\n" + format_phase1_no_new(phase1_diag),
             )
 
-        if len(seen_ids) == 0:
+        if _is_initial_seed_run():
             for item in new_items:
                 seen_ids.add(item["id"])
             seen_saved = _maybe_save_seen_ids(seen_ids)
