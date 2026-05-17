@@ -24,7 +24,13 @@ def _get_nested(obj, path):
     return obj
 
 
-def send_error_to_slack(webhook_url, error_message, current_phase=None, partial_result=None):
+def send_error_to_slack(
+    webhook_url,
+    error_message,
+    current_phase=None,
+    partial_result=None,
+    gemini_raw=None,
+):
     if not webhook_url:
         return
     safe_error = error_message.replace("```", "'''")
@@ -38,6 +44,17 @@ def send_error_to_slack(webhook_url, error_message, current_phase=None, partial_
             "text": {"type": "mrkdwn", "text": f"{phase_label}```\n{safe_error}\n```"},
         },
     ]
+    if gemini_raw:
+        safe_raw = str(gemini_raw).replace("```", "'''")
+        if len(safe_raw) > 1800:
+            safe_raw = safe_raw[:1800] + "...(truncated)"
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"Gemini raw (head):\n```\n{safe_raw}\n```",
+            },
+        })
     if partial_result:
         safe_partial = json.dumps(partial_result, ensure_ascii=False)
         if len(safe_partial) > 1800:
@@ -360,19 +377,77 @@ def call_gemini(keys_str, max_usage, reset_hour_utc, prompt_text, model_name):
     raise RuntimeError("Gemini API call failed")
 
 
-def validate_json_list(text, required_fields, phase_tag, pass_field=None):
+def _strip_json_code_fence(text):
+    text = (text or "").strip()
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _parse_gemini_json_array(text, phase_tag):
+    cleaned = _strip_json_code_fence(text)
     try:
-        data = json.loads(text)
+        data = json.loads(cleaned)
     except json.JSONDecodeError as e:
-        raise ValueError(f"[{phase_tag}] JSON parse error: {e}\n{text[:500]}")
+        raise ValueError(f"[{phase_tag}] JSON parse error: {e}\n{cleaned[:500]}")
+    if isinstance(data, dict):
+        for key in ("items", "results", "data", "array"):
+            nested = data.get(key)
+            if isinstance(nested, list):
+                data = nested
+                break
     if not isinstance(data, list):
-        raise ValueError(f"[{phase_tag}] Response is not a JSON array: {type(data).__name__}")
+        raise ValueError(
+            f"[{phase_tag}] Response is not a JSON array: {type(data).__name__}"
+        )
+    return data
+
+
+_REASON_FIELD_ALIASES = ("rejection_reason", "screening_reason", "summary", "note")
+
+
+def _default_reason_text(item):
+    for key in _REASON_FIELD_ALIASES:
+        value = item.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()[:80]
+    score = item.get("screening_score", item.get("safety_score", item.get("score")))
+    pass_value = item.get("pass")
+    if score is not None and pass_value is not None:
+        return f"score={score}, pass={pass_value}"[:80]
+    if pass_value is not None:
+        return f"pass={pass_value}"[:80]
+    if score is not None:
+        return f"score={score}"[:80]
+    return "（理由未記載・自動補完）"
+
+
+def _normalize_gemini_item(item, required_fields):
+    if not isinstance(item, dict):
+        return item
+    normalized = dict(item)
+    if "reason" in required_fields and "reason" not in normalized:
+        normalized["reason"] = _default_reason_text(normalized)
+    return normalized
+
+
+def validate_json_list(text, required_fields, phase_tag, pass_field=None):
+    data = _parse_gemini_json_array(text, phase_tag)
     for i, item in enumerate(data):
         if not isinstance(item, dict):
             raise ValueError(f"[{phase_tag}] Item [{i}] is not an object")
+        item = _normalize_gemini_item(item, required_fields)
+        data[i] = item
         for field in required_fields:
             if field not in item:
-                raise ValueError(f"[{phase_tag}] Item [{i}] missing required field: '{field}'")
+                raise ValueError(
+                    f"[{phase_tag}] Item [{i}] missing required field: '{field}'"
+                )
         if pass_field and pass_field in item and not isinstance(item[pass_field], bool):
             raise ValueError(
                 f"[{phase_tag}] Item [{i}] field '{pass_field}' must be boolean true/false, "
@@ -1025,6 +1100,7 @@ def scrape_detail(page, items, detail_cfg):
 def main():
     SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
     partial_result = None
+    last_gemini_raw = None
     current_phase = "init"
 
     try:
@@ -1155,6 +1231,7 @@ def main():
                 build_phase_prompt(AI_PROMPT, PROMPT_PHASE2, new_items),
                 GEMINI_MODEL,
             )
+            last_gemini_raw = raw
             gemini_calls += 1
             result2 = validate_json_list(
                 raw, phase2_fields, current_phase, pass_field=PHASE2_PASS_FIELD,
@@ -1220,6 +1297,7 @@ def main():
                 build_phase_prompt(AI_PROMPT, PROMPT_PHASE4, detailed_items),
                 GEMINI_MODEL,
             )
+            last_gemini_raw = raw
             gemini_calls += 1
             result4 = validate_json_list(
                 raw, phase4_fields, current_phase, pass_field=PHASE4_PASS_FIELD,
@@ -1271,6 +1349,7 @@ def main():
                 build_phase_prompt(AI_PROMPT, PROMPT_PHASE5, phase5_input),
                 GEMINI_MODEL,
             )
+            last_gemini_raw = raw
             gemini_calls += 1
             result5 = validate_json_list(raw, phase5_fields, current_phase)
             result5 = merge_items_by_id(phase5_input, result5)
@@ -1363,7 +1442,13 @@ def main():
 
     except Exception:
         error_msg = traceback.format_exc()
-        send_error_to_slack(SLACK_WEBHOOK_URL, error_msg, current_phase, partial_result)
+        send_error_to_slack(
+            SLACK_WEBHOOK_URL,
+            error_msg,
+            current_phase,
+            partial_result,
+            gemini_raw=locals().get("last_gemini_raw"),
+        )
         secure_exit()
 
 
