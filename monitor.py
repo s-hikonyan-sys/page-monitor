@@ -128,14 +128,36 @@ def _slack_link(url, label):
     return f"<{safe_url}|{safe_label}>"
 
 
+_SLACK_LIMIT_PROPOSAL = 1200
+_SLACK_LIMIT_LONG = 800
+_SLACK_LIMIT_DEFAULT = 500
+_SLACK_LONG_TEXT_KEYS = frozenset({
+    "risk_findings",
+    "credibility_good",
+    "credibility_bad",
+    "buyer_pain_point",
+    "technical_requirements",
+    "implementation_challenges",
+    "proposed_solutions_to_implementation_challenges",
+})
+
+
 def _format_slack_field_value(key, value, entry, url_template):
     if key in ("id", "url"):
         link_url = value if key == "url" and value else _resolve_item_url(entry, url_template)
         if link_url:
             label = entry.get("id", value) if key == "url" else value
             return _slack_link(link_url, label)
-    text = str(value)
-    limit = 1200 if key == "proposal_text" else 500
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False)
+    else:
+        text = str(value)
+    if key == "proposal_text":
+        limit = _SLACK_LIMIT_PROPOSAL
+    elif key in _SLACK_LONG_TEXT_KEYS:
+        limit = _SLACK_LIMIT_LONG
+    else:
+        limit = _SLACK_LIMIT_DEFAULT
     if len(text) > limit:
         text = text[:limit] + "...(truncated)"
     return text
@@ -227,9 +249,33 @@ def format_run_summary(exit_reason, **ctx):
             f"  pass_field: {ctx.get('pass_field', 'pass')}",
             "",
         ])
+    if ctx.get("phase5_draft") is not None:
+        lines.extend([
+            "Phase5-draft:",
+            f"  items: {ctx['phase5_draft']}",
+            "",
+        ])
+    if ctx.get("phase5a") is not None:
+        lines.extend([
+            "Phase5-A (risk):",
+            f"  items: {ctx['phase5a']}",
+            "",
+        ])
+    if ctx.get("phase5b") is not None:
+        lines.extend([
+            "Phase5-B (buyer):",
+            f"  items: {ctx['phase5b']}",
+            "",
+        ])
+    if ctx.get("phase6") is not None:
+        lines.extend([
+            "Phase6 (revision):",
+            f"  items: {ctx['phase6']}",
+            "",
+        ])
     if "phase5_total" in ctx:
         lines.extend([
-            "Phase5:",
+            "Phase5 (final):",
             f"  results: {ctx['phase5_total']}",
             f"  notified (pass=true, score>={ctx.get('pass_threshold', '?')}): "
             f"{ctx.get('notified_count', 0)}",
@@ -478,6 +524,39 @@ def merge_items_by_id(*item_lists):
 
 def build_phase_prompt(base_prompt, phase_prompt, data):
     return f"{base_prompt}\n\n{phase_prompt}\n\n{json.dumps(data, ensure_ascii=False)}"
+
+
+def _parse_csv_fields(fields_str):
+    return [f.strip() for f in (fields_str or "").split(",") if f.strip()]
+
+
+def _format_phase4_passed_slack(passed4, url_template, sample_max=3):
+    ranked = sorted(
+        [x for x in passed4 if isinstance(x, dict)],
+        key=_score_for_sort,
+        reverse=True,
+    )
+    lines = [f"Phase4 passed: {len(passed4)} item(s)", ""]
+    for item in ranked[:sample_max]:
+        item_id = item.get("id", "?")
+        url = _resolve_item_url(item, url_template)
+        head = _slack_link(url, item_id) if url else str(item_id)
+        safety = item.get("safety_score", "?")
+        reason = str(item.get("reason", ""))[:180]
+        we = item.get("work_estimate")
+        we_text = (
+            json.dumps(we, ensure_ascii=False)[:200]
+            if isinstance(we, dict) else str(we)[:200]
+        )
+        lines.append(f"- {head} safety={safety}")
+        if we_text:
+            lines.append(f"  work_estimate: {we_text}")
+        if reason:
+            lines.append(f"  reason: {reason}")
+    remaining = len(ranked) - sample_max
+    if remaining > 0:
+        lines.append(f"- ... and {remaining} more")
+    return "\n".join(lines)
 
 
 def _ld_type_matches(node, expected_type):
@@ -1114,9 +1193,16 @@ def main():
         PROMPT_PHASE2 = os.environ.get("PROMPT_PHASE2")
         PROMPT_PHASE4 = os.environ.get("PROMPT_PHASE4")
         PROMPT_PHASE5 = os.environ.get("PROMPT_PHASE5")
+        PROMPT_PHASE5_REVIEW_A = os.environ.get("PROMPT_PHASE5_REVIEW_A")
+        PROMPT_PHASE5_REVIEW_B = os.environ.get("PROMPT_PHASE5_REVIEW_B")
+        PROMPT_PHASE6_REVISION = os.environ.get("PROMPT_PHASE6_REVISION")
         PHASE2_FIELDS = os.environ.get("PHASE2_FIELDS", "")
         PHASE4_FIELDS = os.environ.get("PHASE4_FIELDS", "")
         PHASE5_FIELDS = os.environ.get("PHASE5_FIELDS", "")
+        PHASE5_REVIEW_A_FIELDS = os.environ.get("PHASE5_REVIEW_A_FIELDS", "")
+        PHASE5_REVIEW_B_FIELDS = os.environ.get("PHASE5_REVIEW_B_FIELDS", "")
+        PHASE6_FIELDS = os.environ.get("PHASE6_FIELDS", "")
+        NOTIFY_PHASE4_PASSED_HEADER = os.environ.get("NOTIFY_PHASE4_PASSED_HEADER", "")
         PHASE2_PASS_FIELD = os.environ.get("PHASE2_PASS_FIELD", "pass")
         PHASE4_PASS_FIELD = os.environ.get("PHASE4_PASS_FIELD", "pass")
         NOTIFY_HEADER = os.environ.get("NOTIFY_HEADER", "New results")
@@ -1338,14 +1424,31 @@ def main():
         else:
             passed4 = passed2
 
+        if NOTIFY_PHASE4_PASSED_HEADER and passed4 and PROMPT_PHASE5:
+            send_info_to_slack(
+                SLACK_WEBHOOK_URL,
+                NOTIFY_PHASE4_PASSED_HEADER,
+                _format_phase4_passed_slack(
+                    passed4,
+                    NOTIFY_URL_TEMPLATE,
+                    sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
+                ),
+            )
+
         notify_pass_field = (
             PHASE4_PASS_FIELD if (DETAIL_CONFIG and PROMPT_PHASE4) else PHASE2_PASS_FIELD
         )
 
+        phase5_draft_count = 0
+        phase5a_count = 0
+        phase5b_count = 0
+        phase6_count = 0
+
         if PROMPT_PHASE5:
-            current_phase = "phase5"
-            phase5_fields = [f.strip() for f in PHASE5_FIELDS.split(",") if f.strip()]
             phase5_input = passed4
+            phase5_fields = _parse_csv_fields(PHASE5_FIELDS)
+
+            current_phase = "phase5-draft"
             raw = call_gemini(
                 KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
                 build_phase_prompt(AI_PROMPT, PROMPT_PHASE5, phase5_input),
@@ -1353,8 +1456,63 @@ def main():
             )
             last_gemini_raw = raw
             gemini_calls += 1
-            result5 = validate_json_list(raw, phase5_fields, current_phase)
-            result5 = merge_items_by_id(phase5_input, result5)
+            result5_draft = validate_json_list(raw, phase5_fields, current_phase)
+            result5_merged = merge_items_by_id(phase5_input, result5_draft)
+            phase5_draft_count = len(result5_merged)
+            partial_result = result5_merged
+
+            result5a_list = []
+            if PROMPT_PHASE5_REVIEW_A:
+                current_phase = "phase5-a"
+                review_a_fields = _parse_csv_fields(PHASE5_REVIEW_A_FIELDS)
+                raw = call_gemini(
+                    KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
+                    build_phase_prompt(
+                        AI_PROMPT, PROMPT_PHASE5_REVIEW_A, result5_merged,
+                    ),
+                    GEMINI_MODEL,
+                )
+                last_gemini_raw = raw
+                gemini_calls += 1
+                result5a_list = validate_json_list(raw, review_a_fields, current_phase)
+                phase5a_count = len(result5a_list)
+
+            result5b_list = []
+            if PROMPT_PHASE5_REVIEW_B:
+                current_phase = "phase5-b"
+                review_b_fields = _parse_csv_fields(PHASE5_REVIEW_B_FIELDS)
+                raw = call_gemini(
+                    KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
+                    build_phase_prompt(
+                        AI_PROMPT, PROMPT_PHASE5_REVIEW_B, result5_merged,
+                    ),
+                    GEMINI_MODEL,
+                )
+                last_gemini_raw = raw
+                gemini_calls += 1
+                result5b_list = validate_json_list(raw, review_b_fields, current_phase)
+                phase5b_count = len(result5b_list)
+
+            result5 = merge_items_by_id(
+                result5_merged,
+                result5a_list,
+                result5b_list,
+            )
+
+            if PROMPT_PHASE6_REVISION:
+                current_phase = "phase6"
+                phase6_fields = _parse_csv_fields(PHASE6_FIELDS)
+                raw = call_gemini(
+                    KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
+                    build_phase_prompt(AI_PROMPT, PROMPT_PHASE6_REVISION, result5),
+                    GEMINI_MODEL,
+                )
+                last_gemini_raw = raw
+                gemini_calls += 1
+                result6_list = validate_json_list(raw, phase6_fields, current_phase)
+                phase6_count = len(result6_list)
+                result5 = merge_items_by_id(result5, result6_list)
+
             partial_result = result5
         else:
             result5 = passed4
@@ -1417,6 +1575,10 @@ def main():
             phase2_passed=len(passed2) if PROMPT_PHASE2 else len(new_items),
             phase4_input=len(detailed_items) if detailed_items else 0,
             phase4_passed=len(passed4) if (DETAIL_CONFIG and PROMPT_PHASE4) else 0,
+            phase5_draft=phase5_draft_count if PROMPT_PHASE5 else None,
+            phase5a=phase5a_count if PROMPT_PHASE5_REVIEW_A else None,
+            phase5b=phase5b_count if PROMPT_PHASE5_REVIEW_B else None,
+            phase6=phase6_count if PROMPT_PHASE6_REVISION else None,
             phase5_total=len(result5),
             notified_count=notified_count,
             pass_threshold=PASS_THRESHOLD,

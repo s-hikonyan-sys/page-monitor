@@ -39,9 +39,16 @@ jobs:
           PROMPT_PHASE2: ${{ secrets.PROMPT_PHASE2 }}
           PROMPT_PHASE4: ${{ secrets.PROMPT_PHASE4 }}
           PROMPT_PHASE5: ${{ secrets.PROMPT_PHASE5 }}
+          PROMPT_PHASE5_REVIEW_A: ${{ secrets.PROMPT_PHASE5_REVIEW_A }}
+          PROMPT_PHASE5_REVIEW_B: ${{ secrets.PROMPT_PHASE5_REVIEW_B }}
+          PROMPT_PHASE6_REVISION: ${{ secrets.PROMPT_PHASE6_REVISION }}
           PHASE2_FIELDS: ${{ secrets.PHASE2_FIELDS }}
           PHASE4_FIELDS: ${{ secrets.PHASE4_FIELDS }}
           PHASE5_FIELDS: ${{ secrets.PHASE5_FIELDS }}
+          PHASE5_REVIEW_A_FIELDS: ${{ secrets.PHASE5_REVIEW_A_FIELDS }}
+          PHASE5_REVIEW_B_FIELDS: ${{ secrets.PHASE5_REVIEW_B_FIELDS }}
+          PHASE6_FIELDS: ${{ secrets.PHASE6_FIELDS }}
+          NOTIFY_PHASE4_PASSED_HEADER: ${{ secrets.NOTIFY_PHASE4_PASSED_HEADER }}
           PHASE2_PASS_FIELD: ${{ secrets.PHASE2_PASS_FIELD }}
           PHASE4_PASS_FIELD: ${{ secrets.PHASE4_PASS_FIELD }}
           NOTIFY_HEADER: ${{ secrets.NOTIFY_HEADER }}
