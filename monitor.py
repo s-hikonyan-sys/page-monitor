@@ -149,18 +149,16 @@ _PROPOSAL_INPUT_KEYS = (
     "id", "title", "url", "description", "meta1", "work_estimate", "delivery_text",
 )
 _PM_REVIEW_INPUT_KEYS = (
-    "id", "title", "url", "description", "meta1", "work_estimate", "delivery_text",
+    "id", "description", "meta1", "work_estimate", "delivery_text",
     "proposal_text", "technical_requirements", "implementation_challenges",
-    "proposed_solutions_to_implementation_challenges",
 )
-_BUYER_REVIEW_KEYS = ("id", "title", "url", "description", "meta1", "proposal_text")
+_BUYER_REVIEW_KEYS = ("id", "title", "description", "meta1", "proposal_text")
 _REVISION_INPUT_KEYS = (
-    "id", "title", "url", "description", "meta1", "delivery_text", "proposal_text",
-    "risk_score", "risk_findings", "reception_score", "buyer_pain_point",
-    "credibility_good", "credibility_bad",
+    "id", "title", "description", "meta1", "delivery_text", "proposal_text",
+    "risk_findings", "buyer_pain_point", "credibility_bad",
 )
 _PHASE7A_INPUT_KEYS = (
-    "id", "title", "url", "description", "meta1", "work_estimate", "delivery_text",
+    "id", "title", "description", "meta1", "work_estimate", "delivery_text",
     "proposal_text",
 )
 
