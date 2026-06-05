@@ -513,12 +513,12 @@ def _rotate_api_key_index(api_state, key_count):
 
 def _is_rate_limit_error(exc):
     if isinstance(exc, ClientError):
-        return getattr(exc, "status_code", None) == 429
+        return getattr(exc, "code", None) == 429
     return False
 
 
 def _is_transient_error(exc):
-    return getattr(exc, "status_code", None) in (500, 503)
+    return getattr(exc, "code", None) in (500, 503)
 
 
 def _parse_429_retry_seconds(exc, default_sec):
