@@ -86,6 +86,8 @@ jobs:
           MAX_API_USAGE: ${{ vars.MAX_API_USAGE }}
           RESET_HOUR_UTC: ${{ vars.RESET_HOUR_UTC }}
           GEMINI_429_RETRY_SEC: ${{ vars.GEMINI_429_RETRY_SEC }}
+          GEMINI_503_MAX_RETRIES: ${{ vars.GEMINI_503_MAX_RETRIES }}
+          GEMINI_503_RETRY_SEC: ${{ vars.GEMINI_503_RETRY_SEC }}
           SKIP_SEEN_IDS_SAVE: ${{ github.event_name == 'workflow_dispatch' && !inputs.persist_state && '1' || '' }}
           IGNORE_SEEN_IDS: ${{ github.event_name == 'workflow_dispatch' && inputs.ignore_seen_ids && '1' || '' }}
         run: python monitor.py

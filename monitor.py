@@ -517,6 +517,10 @@ def _is_rate_limit_error(exc):
     return False
 
 
+def _is_transient_error(exc):
+    return getattr(exc, "status_code", None) in (500, 503)
+
+
 def _parse_429_retry_seconds(exc, default_sec):
     try:
         response_json = getattr(exc, "response_json", None) or {}
@@ -536,11 +540,14 @@ def call_gemini(keys_str, max_usage, reset_hour_utc, prompt_text, model_name):
     if not key_list:
         raise ValueError("API keys not configured.")
 
-    retry_delay_sec = int(os.environ.get("GEMINI_429_RETRY_SEC", "60"))
-    max_attempts = len(key_list)
-    last_exc = None
+    retry_delay_sec = int(os.environ.get("GEMINI_429_RETRY_SEC") or "60")
+    transient_max_retries = int(os.environ.get("GEMINI_503_MAX_RETRIES") or "100")
+    transient_retry_sec = int(os.environ.get("GEMINI_503_RETRY_SEC") or "60")
+    max_key_attempts = len(key_list)
+    rate_limit_key_attempts = 0
+    transient_attempts = 0
 
-    for _ in range(max_attempts):
+    while True:
         current_key, api_state = get_current_api_key(keys_str, max_usage, reset_hour_utc)
         try:
             client = genai.Client(api_key=current_key)
@@ -554,17 +561,22 @@ def call_gemini(keys_str, max_usage, reset_hour_utc, prompt_text, model_name):
             _record_api_attempt(api_state)
             return response.text
         except Exception as e:
-            last_exc = e
-            _record_api_attempt(api_state)
             if _is_rate_limit_error(e):
+                _record_api_attempt(api_state)
+                rate_limit_key_attempts += 1
+                if rate_limit_key_attempts >= max_key_attempts:
+                    raise
                 _rotate_api_key_index(api_state, len(key_list))
                 time.sleep(_parse_429_retry_seconds(e, retry_delay_sec))
+                transient_attempts = 0
+                continue
+            if _is_transient_error(e):
+                transient_attempts += 1
+                if transient_attempts > transient_max_retries:
+                    raise
+                time.sleep(transient_retry_sec)
                 continue
             raise
-
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError("Gemini API call failed")
 
 
 def _strip_json_code_fence(text):
