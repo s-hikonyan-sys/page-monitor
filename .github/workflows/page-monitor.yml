@@ -2,9 +2,9 @@ name: General Page UI Monitor
 
 on:
   schedule:
-    - cron: '0 1 * * *'  # 毎日 JST 10:00 (UTC 01:00)
-    - cron: '0 5 * * *'  # 毎日 JST 14:00 (UTC 05:00)
-    - cron: '0 9 * * *'  # 毎日 JST 18:00 (UTC 09:00)
+    - cron: '0 21 * * *'  # 毎日 JST 06:00 (UTC 21:00)
+    - cron: '0 1 * * *'   # 毎日 JST 10:00 (UTC 01:00)
+    - cron: '0 5 * * *'   # 毎日 JST 14:00 (UTC 05:00)
   workflow_dispatch:
     inputs:
       persist_state:
@@ -88,6 +88,8 @@ jobs:
           GEMINI_429_RETRY_SEC: ${{ vars.GEMINI_429_RETRY_SEC }}
           GEMINI_503_MAX_RETRIES: ${{ vars.GEMINI_503_MAX_RETRIES }}
           GEMINI_503_RETRY_SEC: ${{ vars.GEMINI_503_RETRY_SEC }}
+          RUNTIME_SETTLE_ROUNDS: ${{ vars.RUNTIME_SETTLE_ROUNDS }}
+          RUNTIME_SETTLE_PAUSE_SEC: ${{ vars.RUNTIME_SETTLE_PAUSE_SEC }}
           SKIP_SEEN_IDS_SAVE: ${{ github.event_name == 'workflow_dispatch' && !inputs.persist_state && '1' || '' }}
           IGNORE_SEEN_IDS: ${{ github.event_name == 'workflow_dispatch' && inputs.ignore_seen_ids && '1' || '' }}
         run: python monitor.py

@@ -1231,11 +1231,18 @@ def format_phase1_scrape_failure(diag):
         lines.append("Errors:")
         for err in diag["errors"][:12]:
             lines.append(f"- {err}")
-    lines.extend([
-        "",
-        "Likely cause: page structure changed, parse config mismatch, headless HTML diff, or load timeout.",
-        "Check PARSE_CONFIG (page_state / dom / LD+JSON) and probe.html_substrings.",
-    ])
+    if _probe_indicates_unsettled(probe):
+        lines.extend([
+            "",
+            "Likely cause: navigation unsettled; runtime settle rounds exhausted.",
+            "Check PARSE_CONFIG if the page structure changed.",
+        ])
+    else:
+        lines.extend([
+            "",
+            "Likely cause: page structure changed, parse config mismatch, headless HTML diff, or load timeout.",
+            "Check PARSE_CONFIG (page_state / dom / LD+JSON) and probe.html_substrings.",
+        ])
     return "\n".join(lines)
 
 
@@ -1259,9 +1266,71 @@ def format_phase1_seed(diag, seeded_count):
     ])
 
 
-def scrape_listing(page, config, seen_ids, max_pages, target_url):
+def _runtime_settle_limits():
+    return (
+        int(os.environ.get("RUNTIME_SETTLE_ROUNDS") or "100"),
+        int(os.environ.get("RUNTIME_SETTLE_PAUSE_SEC") or "30"),
+    )
+
+
+def _probe_indicates_unsettled(probe):
+    if not probe:
+        return False
+    title = (probe.get("title") or "").lower()
+    if "forbidden" in title:
+        return True
+    if probe.get("htmlLength", 0) < 500:
+        return True
+    return False
+
+
+def _navigation_unsettled(response, page, config):
+    status = response.status if response is not None else None
+    if status in (403, 429, 502, 503):
+        return True
+    try:
+        probe = _probe_listing_page(page, config)
+    except Exception:
+        return True
+    return _probe_indicates_unsettled(probe)
+
+
+def _replace_page(context, page):
+    try:
+        page.close()
+    except Exception:
+        pass
+    return context.new_page()
+
+
+def _load_page_with_settle(context, page, url, goto_wait, config, diagnostics, page_num):
+    max_rounds, pause_sec = _runtime_settle_limits()
+    response = None
+    for round_num in range(1, max_rounds + 2):
+        response = page.goto(url, wait_until=goto_wait, timeout=30000)
+        if not _navigation_unsettled(response, page, config):
+            if round_num > 1:
+                diagnostics["errors"].append(
+                    f"page {page_num}: runtime settle ok on round {round_num}",
+                )
+            return page, response
+        if round_num <= max_rounds:
+            diagnostics["errors"].append(
+                f"page {page_num}: runtime settle round {round_num}/{max_rounds}",
+            )
+            time.sleep(pause_sec)
+            page = _replace_page(context, page)
+        else:
+            diagnostics["errors"].append(
+                f"page {page_num}: runtime settle exhausted ({max_rounds} rounds)",
+            )
+    return page, response
+
+
+def _scrape_listing_once(page, config, seen_ids, max_pages, target_url):
     diagnostics = _empty_phase1_diagnostics(seen_ids)
     scraped_all = []
+    context = page.context
     dom_cfg = config.get("dom") or {}
     use_dom = bool(dom_cfg.get("link_selector"))
     use_page_state = bool((config.get("page_state") or {}).get("global"))
@@ -1283,7 +1352,9 @@ def scrape_listing(page, config, seen_ids, max_pages, target_url):
         page_state_items = []
 
         try:
-            page.goto(page_url, wait_until=goto_wait, timeout=30000)
+            page, _response = _load_page_with_settle(
+                context, page, page_url, goto_wait, config, diagnostics, page_num,
+            )
             if wait_selector:
                 try:
                     page.wait_for_selector(
@@ -1350,6 +1421,35 @@ def scrape_listing(page, config, seen_ids, max_pages, target_url):
     diagnostics["scraped_total"] = len(scraped_all)
     diagnostics["new_count"] = len(new_items)
     return new_items, diagnostics
+
+
+def scrape_listing(page, config, seen_ids, max_pages, target_url):
+    context = page.context
+    max_rounds, pause_sec = _runtime_settle_limits()
+    last_result = ([], _empty_phase1_diagnostics(seen_ids))
+
+    for outer_round in range(1, max_rounds + 2):
+        new_items, diagnostics = _scrape_listing_once(
+            page, config, seen_ids, max_pages, target_url,
+        )
+        last_result = (new_items, diagnostics)
+        if diagnostics["scraped_total"] > 0:
+            return new_items, diagnostics
+        if not _probe_indicates_unsettled(diagnostics.get("runtime_probe")):
+            return new_items, diagnostics
+        if outer_round <= max_rounds:
+            diagnostics["errors"].append(
+                f"listing runtime settle outer round {outer_round}/{max_rounds}",
+            )
+            time.sleep(pause_sec)
+            page = _replace_page(context, page)
+        else:
+            diagnostics["errors"].append(
+                f"listing runtime settle exhausted ({max_rounds} outer rounds)",
+            )
+            return new_items, diagnostics
+
+    return last_result
 
 
 def scrape_detail(page, items, detail_cfg):
