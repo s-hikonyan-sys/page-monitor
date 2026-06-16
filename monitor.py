@@ -12,7 +12,8 @@ from google import genai
 from google.genai import types
 from google.genai.errors import ClientError
 
-STATE_FILE = "seen_ids.txt"
+_SUFFIX = os.environ.get("STATE_SUFFIX", "")
+STATE_FILE = f"seen_ids{_SUFFIX}.txt"
 API_STATE_FILE = "api_state.json"
 
 
@@ -1452,6 +1453,59 @@ def scrape_listing(page, config, seen_ids, max_pages, target_url):
     return last_result
 
 
+def _scrape_detail_dom(page, detail, detail_cfg):
+    """DOM ベースの詳細ページ取得（LD+JSON が存在しないサイト向け）。
+    detail_cfg に dom_desc セクションがある場合に呼ばれる。
+    dl_selector で指定した <dl> の <dt>/<dd> ペアを dt_dd_map に従ってフィールドに格納する。
+    """
+    dom_desc_cfg = detail_cfg.get("dom_desc") or {}
+    if not dom_desc_cfg:
+        return detail
+    dl_sel = dom_desc_cfg.get("dl_selector", "dl")
+    dt_dd_map = dom_desc_cfg.get("dt_dd_map") or {}
+    desc_max = int(dom_desc_cfg.get("desc_max", 600))
+    rating_label = detail_cfg.get("rating_label", "meta1")
+    if not dt_dd_map:
+        return detail
+    try:
+        extracted = page.evaluate(
+            """
+            (args) => {
+                const result = {};
+                for (const dl of document.querySelectorAll(args.dlSelector)) {
+                    let lastDt = null;
+                    for (const el of dl.querySelectorAll("dt, dd")) {
+                        if (el.tagName === "DT") {
+                            lastDt = (el.innerText || "").trim();
+                        } else if (el.tagName === "DD" && lastDt !== null) {
+                            if (args.dtDdMap[lastDt] && !result[args.dtDdMap[lastDt]]) {
+                                result[args.dtDdMap[lastDt]] = (el.innerText || "").trim();
+                            }
+                            lastDt = null;
+                        }
+                    }
+                }
+                return result;
+            }
+            """,
+            {"dlSelector": dl_sel, "dtDdMap": dt_dd_map},
+        )
+        for src_field, value in (extracted or {}).items():
+            if src_field == "description":
+                detail["description"] = (value or detail.get("description", ""))[:desc_max]
+            elif src_field == "price":
+                if value:
+                    detail["price"] = value
+            else:
+                detail[src_field] = value
+        if rating_label not in detail:
+            detail[rating_label] = "N/A"
+    except Exception:
+        if rating_label not in detail:
+            detail[rating_label] = "N/A"
+    return detail
+
+
 def scrape_detail(page, items, detail_cfg):
     ld_type = detail_cfg.get("ld_type", "")
     desc_path = detail_cfg.get("description_path", "description")
@@ -1460,39 +1514,45 @@ def scrape_detail(page, items, detail_cfg):
     price_path = detail_cfg.get("price_path")
     rating_label = detail_cfg.get("rating_label", "meta1")
     rating_fmt = detail_cfg.get("rating_format", "{v}/{c}")
+    use_dom_desc = bool(detail_cfg.get("dom_desc"))
     results = []
     for item in items:
         detail = dict(item)
         try:
             page.goto(item["url"], wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(3000)
-            for script_text in page.locator('script[type="application/ld+json"]').all_inner_texts():
-                try:
-                    ld = json.loads(script_text)
-                    matched = False
-                    for node in _iter_ld_nodes(ld):
-                        if _ld_type_matches(node, ld_type):
-                            ld = node
-                            matched = True
-                            break
-                    if not matched:
+            ld_matched = False
+            if ld_type or desc_path or rv_path or rc_path or price_path:
+                for script_text in page.locator('script[type="application/ld+json"]').all_inner_texts():
+                    try:
+                        ld = json.loads(script_text)
+                        matched = False
+                        for node in _iter_ld_nodes(ld):
+                            if _ld_type_matches(node, ld_type):
+                                ld = node
+                                matched = True
+                                break
+                        if not matched:
+                            continue
+                        if desc_path:
+                            detail["description"] = (
+                                _get_nested(ld, desc_path) or item.get("description", "")
+                            )[:600]
+                        rv = _get_nested(ld, rv_path) if rv_path else None
+                        rc = _get_nested(ld, rc_path) if rc_path else None
+                        price = _get_nested(ld, price_path) if price_path else None
+                        detail[rating_label] = (
+                            rating_fmt.replace("{v}", str(rv)).replace("{c}", str(rc))
+                            if rv and rc else "N/A"
+                        )
+                        if price:
+                            detail["price"] = str(price)
+                        ld_matched = True
+                        break
+                    except Exception:
                         continue
-                    if desc_path:
-                        detail["description"] = (
-                            _get_nested(ld, desc_path) or item.get("description", "")
-                        )[:600]
-                    rv = _get_nested(ld, rv_path) if rv_path else None
-                    rc = _get_nested(ld, rc_path) if rc_path else None
-                    price = _get_nested(ld, price_path) if price_path else None
-                    detail[rating_label] = (
-                        rating_fmt.replace("{v}", str(rv)).replace("{c}", str(rc))
-                        if rv and rc else "N/A"
-                    )
-                    if price:
-                        detail["price"] = str(price)
-                    break
-                except Exception:
-                    continue
+            if use_dom_desc and not ld_matched:
+                detail = _scrape_detail_dom(page, detail, detail_cfg)
         except Exception:
             detail[rating_label] = "N/A"
         results.append(detail)

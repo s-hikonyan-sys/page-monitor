@@ -1,0 +1,104 @@
+name: General Page UI Monitor 2
+
+on:
+  schedule:
+    - cron: '0 23 * * *'  # 毎日 JST 08:00 (UTC 23:00)
+    - cron: '0 3 * * *'   # 毎日 JST 12:00 (UTC 03:00)
+    - cron: '0 7 * * *'   # 毎日 JST 16:00 (UTC 07:00)
+  workflow_dispatch:
+    inputs:
+      persist_state:
+        description: 'Commit seen_ids_2.txt and api_state_2.json after the run'
+        type: boolean
+        default: false
+      ignore_seen_ids:
+        description: 'Ignore seen_ids; run full pipeline on all scraped items (skip seed; manual test)'
+        type: boolean
+        default: false
+
+jobs:
+  check-and-notify:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install .
+          python -m playwright install chromium --with-deps
+
+      - name: Run Pipeline
+        env:
+          STATE_SUFFIX: "_2"
+          TARGET_URL: ${{ secrets.TARGET_URL_2 }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL_2 }}
+          AI_PROMPT: ${{ secrets.AI_PROMPT_2 }}
+          AI_PROMPT_PROPOSAL: ${{ secrets.AI_PROMPT_PROPOSAL_2 }}
+          AI_PROMPT_PM: ${{ secrets.AI_PROMPT_PM_2 }}
+          PARSE_CONFIG: ${{ secrets.PARSE_CONFIG_2 }}
+          DETAIL_CONFIG: ${{ secrets.DETAIL_CONFIG_2 }}
+          PROMPT_PHASE2: ${{ secrets.PROMPT_PHASE2_2 }}
+          PROMPT_PHASE4: ${{ secrets.PROMPT_PHASE4_2 }}
+          PROMPT_PHASE5: ${{ secrets.PROMPT_PHASE5_2 }}
+          PROMPT_PHASE5_REVIEW_A: ${{ secrets.PROMPT_PHASE5_REVIEW_A_2 }}
+          PROMPT_PHASE5_REVIEW_B: ${{ secrets.PROMPT_PHASE5_REVIEW_B_2 }}
+          PROMPT_PHASE6_REVISION: ${{ secrets.PROMPT_PHASE6_REVISION_2 }}
+          PROMPT_PHASE7_REVIEW_A: ${{ secrets.PROMPT_PHASE7_REVIEW_A_2 }}
+          PROMPT_PHASE7_REVIEW_B: ${{ secrets.PROMPT_PHASE7_REVIEW_B_2 }}
+          PHASE2_FIELDS: ${{ secrets.PHASE2_FIELDS_2 }}
+          PHASE4_FIELDS: ${{ secrets.PHASE4_FIELDS_2 }}
+          PHASE5_FIELDS: ${{ secrets.PHASE5_FIELDS_2 }}
+          PHASE5_REVIEW_A_FIELDS: ${{ secrets.PHASE5_REVIEW_A_FIELDS_2 }}
+          PHASE5_REVIEW_B_FIELDS: ${{ secrets.PHASE5_REVIEW_B_FIELDS_2 }}
+          PHASE6_FIELDS: ${{ secrets.PHASE6_FIELDS_2 }}
+          PHASE7_REVIEW_A_FIELDS: ${{ secrets.PHASE7_REVIEW_A_FIELDS_2 }}
+          PHASE7_REVIEW_B_FIELDS: ${{ secrets.PHASE7_REVIEW_B_FIELDS_2 }}
+          NOTIFY_PHASE4_PASSED_HEADER: ${{ secrets.NOTIFY_PHASE4_PASSED_HEADER_2 }}
+          NOTIFY_PHASE5_DRAFT_REVIEW_HEADER: ${{ secrets.NOTIFY_PHASE5_DRAFT_REVIEW_HEADER_2 }}
+          NOTIFY_PHASE6_HEADER: ${{ secrets.NOTIFY_PHASE6_HEADER_2 }}
+          NOTIFY_PHASE7_HEADER: ${{ secrets.NOTIFY_PHASE7_HEADER_2 }}
+          PHASE2_PASS_FIELD: ${{ secrets.PHASE2_PASS_FIELD_2 }}
+          PHASE4_PASS_FIELD: ${{ secrets.PHASE4_PASS_FIELD_2 }}
+          NOTIFY_HEADER: ${{ secrets.NOTIFY_HEADER_2 }}
+          NOTIFY_NO_NEW_HEADER: ${{ secrets.NOTIFY_NO_NEW_HEADER_2 }}
+          NOTIFY_SEED_HEADER: ${{ secrets.NOTIFY_SEED_HEADER_2 }}
+          NOTIFY_PHASE2_REJECTED_HEADER: ${{ secrets.NOTIFY_PHASE2_REJECTED_HEADER_2 }}
+          NOTIFY_PHASE4_REJECTED_HEADER: ${{ secrets.NOTIFY_PHASE4_REJECTED_HEADER_2 }}
+          NOTIFY_PHASE5_EMPTY_HEADER: ${{ secrets.NOTIFY_PHASE5_EMPTY_HEADER_2 }}
+          NOTIFY_BELOW_THRESHOLD_HEADER: ${{ secrets.NOTIFY_BELOW_THRESHOLD_HEADER_2 }}
+          NOTIFY_SUCCESS_SUMMARY_HEADER: ${{ secrets.NOTIFY_SUCCESS_SUMMARY_HEADER_2 }}
+          NOTIFY_URL_TEMPLATE: ${{ secrets.NOTIFY_URL_TEMPLATE_2 }}
+          NOTIFY_FIELDS: ${{ secrets.NOTIFY_FIELDS_2 }}
+          NOTIFY_SUMMARY_SAMPLE_MAX: ${{ vars.NOTIFY_SUMMARY_SAMPLE_MAX_2 }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          PASS_THRESHOLD: ${{ vars.PASS_THRESHOLD_2 }}
+          MAX_PAGES: ${{ vars.MAX_PAGES_2 }}
+          MAX_API_USAGE: ${{ vars.MAX_API_USAGE_2 }}
+          RESET_HOUR_UTC: ${{ vars.RESET_HOUR_UTC_2 }}
+          GEMINI_429_RETRY_SEC: ${{ vars.GEMINI_429_RETRY_SEC }}
+          GEMINI_503_MAX_RETRIES: ${{ vars.GEMINI_503_MAX_RETRIES }}
+          GEMINI_503_RETRY_SEC: ${{ vars.GEMINI_503_RETRY_SEC }}
+          RUNTIME_SETTLE_ROUNDS: ${{ vars.RUNTIME_SETTLE_ROUNDS }}
+          RUNTIME_SETTLE_PAUSE_SEC: ${{ vars.RUNTIME_SETTLE_PAUSE_SEC }}
+          SKIP_SEEN_IDS_SAVE: ${{ github.event_name == 'workflow_dispatch' && !inputs.persist_state && '1' || '' }}
+          IGNORE_SEEN_IDS: ${{ github.event_name == 'workflow_dispatch' && inputs.ignore_seen_ids && '1' || '' }}
+        run: python monitor.py
+
+      - name: Commit and Push State
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.persist_state == true))
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add seen_ids_2.txt api_state.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: update state files (2)" && git push)
