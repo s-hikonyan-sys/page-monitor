@@ -16,6 +16,130 @@ _SUFFIX = os.environ.get("STATE_SUFFIX", "")
 STATE_FILE = f"seen_ids{_SUFFIX}.txt"
 API_STATE_FILE = "api_state.json"
 
+_BROWSER_RUNTIME_PATCH = """
+(function () {
+  try {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  } catch (e) {}
+
+  try {
+    if (!window.chrome) { window.chrome = {}; }
+    if (!window.chrome.runtime) {
+      window.chrome.runtime = {
+        id: undefined,
+        connect: function(){},
+        sendMessage: function(){},
+        onMessage: { addListener: function(){}, removeListener: function(){} },
+        onConnect: { addListener: function(){}, removeListener: function(){} },
+      };
+    }
+    window.chrome.loadTimes = function() { return null; };
+    window.chrome.csi = function() { return { onloadT: Date.now(), pageT: Date.now(), startE: Date.now(), tran: 15 }; };
+    window.chrome.app = { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } };
+  } catch (e) {}
+
+  try {
+    const fakeMime = (type, desc, suffixes) => {
+      const m = Object.create(MimeType.prototype);
+      Object.defineProperties(m, {
+        type: { get: () => type }, description: { get: () => desc }, suffixes: { get: () => suffixes }, enabledPlugin: { get: () => null },
+      });
+      return m;
+    };
+    const fakePlugin = (name, desc, filename, mimes) => {
+      const p = Object.create(Plugin.prototype);
+      Object.defineProperties(p, {
+        name: { get: () => name }, description: { get: () => desc }, filename: { get: () => filename }, length: { get: () => mimes.length },
+      });
+      mimes.forEach((m, i) => { p[i] = m; });
+      return p;
+    };
+    const pdfMime = fakeMime('application/pdf', 'Portable Document Format', 'pdf');
+    const plugins = [
+      fakePlugin('Chrome PDF Plugin', 'Portable Document Format', 'internal-pdf-viewer', [pdfMime]),
+      fakePlugin('Chrome PDF Viewer', '', 'mhjfbmdgcfjbbpaeojofohoefgiehjai', [pdfMime]),
+      fakePlugin('Native Client', '', 'internal-nacl-plugin', []),
+    ];
+    const pa = Object.create(PluginArray.prototype);
+    Object.defineProperty(pa, 'length', { get: () => plugins.length });
+    plugins.forEach((pl, i) => { pa[i] = pl; pa[pl.name] = pl; });
+    pa.item = (i) => pa[i];
+    pa.namedItem = (n) => pa[n];
+    Object.defineProperty(navigator, 'plugins', { get: () => pa });
+    Object.defineProperty(navigator, 'mimeTypes', { get: () => { const ma = Object.create(MimeTypeArray.prototype); ma[0] = pdfMime; Object.defineProperty(ma, 'length', { get: () => 1 }); return ma; } });
+  } catch (e) {}
+
+  try {
+    Object.defineProperty(navigator, 'languages', { get: () => ['ja-JP', 'ja', 'en-US', 'en'] });
+    Object.defineProperty(navigator, 'language', { get: () => 'ja-JP' });
+  } catch (e) {}
+
+  try {
+    const origQuery = navigator.permissions.query.bind(navigator.permissions);
+    navigator.permissions.query = (params) => {
+      if (params && params.name === 'notifications') {
+        return Promise.resolve({ state: Notification.permission, onchange: null });
+      }
+      return origQuery(params);
+    };
+  } catch (e) {}
+
+  try {
+    Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 1 });
+  } catch (e) {}
+
+  try {
+    const origGetParam = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(param) {
+      if (param === 37445) return 'Intel Inc.';
+      if (param === 37446) return 'Intel Iris OpenGL Engine';
+      return origGetParam.apply(this, arguments);
+    };
+    const orig2 = WebGL2RenderingContext.prototype.getParameter;
+    WebGL2RenderingContext.prototype.getParameter = function(param) {
+      if (param === 37445) return 'Intel Inc.';
+      if (param === 37446) return 'Intel Iris OpenGL Engine';
+      return orig2.apply(this, arguments);
+    };
+  } catch (e) {}
+
+  try {
+    const origContentWindow = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
+    if (origContentWindow) {
+      Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+        get: function() {
+          const w = origContentWindow.get.call(this);
+          if (w && !w.chrome) { try { w.chrome = window.chrome; } catch (ex) {} }
+          return w;
+        },
+      });
+    }
+  } catch (e) {}
+
+  try {
+    Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+    Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
+  } catch (e) {}
+
+  try {
+    Object.defineProperty(window, 'devicePixelRatio', { get: () => 1 });
+  } catch (e) {}
+
+  try {
+    const origErr = Error;
+    window.Error = function(...args) {
+      const err = new origErr(...args);
+      if (err.stack) {
+        err.stack = err.stack.split('\\n').filter(l => !l.includes('puppeteer') && !l.includes('playwright')).join('\\n');
+      }
+      return err;
+    };
+    Object.setPrototypeOf(window.Error, origErr);
+    Object.defineProperty(window.Error, 'stackTraceLimit', { get: () => origErr.stackTraceLimit, set: (v) => { origErr.stackTraceLimit = v; } });
+  } catch (e) {}
+})();
+"""
+
 
 def _get_nested(obj, path):
     for key in path.split("."):
@@ -1267,6 +1391,63 @@ def format_phase1_seed(diag, seeded_count):
     ])
 
 
+def _make_browser_context(p):
+    """Chromium ブラウザ + コンテキストを生成する"""
+    browser = p.chromium.launch(
+        headless=True,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-infobars",
+            "--disable-background-networking",
+            "--disable-default-apps",
+            "--disable-extensions",
+            "--disable-sync",
+            "--disable-translate",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-client-side-phishing-detection",
+            "--disable-hang-monitor",
+            "--disable-popup-blocking",
+            "--mute-audio",
+            "--no-first-run",
+            "--safebrowsing-disable-auto-update",
+            "--metrics-recording-only",
+            "--use-mock-keychain",
+            "--lang=ja-JP",
+            "--window-size=1920,1080",
+            "--force-color-profile=srgb",
+        ],
+    )
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        viewport={"width": 1920, "height": 1080},
+        locale="ja-JP",
+        timezone_id="Asia/Tokyo",
+        color_scheme="light",
+        extra_http_headers={
+            "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;"
+                "q=0.9,image/avif,image/webp,image/apng,*/*;"
+                "q=0.8,application/signed-exchange;v=b3;q=0.7"
+            ),
+            "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Upgrade-Insecure-Requests": "1",
+        },
+    )
+    context.add_init_script(_BROWSER_RUNTIME_PATCH)
+    return browser, context
+
+
 def _runtime_settle_limits():
     return (
         int(os.environ.get("RUNTIME_SETTLE_ROUNDS") or "100"),
@@ -1280,7 +1461,17 @@ def _probe_indicates_unsettled(probe):
     title = (probe.get("title") or "").lower()
     if "forbidden" in title:
         return True
+    _unsettled_page_patterns = (
+        "human verification", "verification", "verify", "captcha",
+        "challenge", "just a moment", "checking your browser",
+        "please wait", "bot detection", "access denied",
+    )
+    if any(kw in title for kw in _unsettled_page_patterns):
+        return True
     if probe.get("htmlLength", 0) < 500:
+        return True
+    substrings = probe.get("substrings") or []
+    if substrings and not any(s.get("found") for s in substrings):
         return True
     return False
 
@@ -1306,9 +1497,20 @@ def _replace_page(context, page):
 
 def _load_page_with_settle(context, page, url, goto_wait, config, diagnostics, page_num):
     max_rounds, pause_sec = _runtime_settle_limits()
+    _page_transition_ms = int((config.get("page_options") or {}).get("transition_wait_ms", 0))
     response = None
     for round_num in range(1, max_rounds + 2):
         response = page.goto(url, wait_until=goto_wait, timeout=30000)
+        if _page_transition_ms > 0:
+            try:
+                probe_early = _probe_listing_page(page, config)
+            except Exception:
+                probe_early = None
+            if _probe_indicates_unsettled(probe_early):
+                diagnostics["errors"].append(
+                    f"page {page_num}: page transition in progress, holding {_page_transition_ms}ms"
+                )
+                page.wait_for_timeout(_page_transition_ms)
         if not _navigation_unsettled(response, page, config):
             if round_num > 1:
                 diagnostics["errors"].append(
@@ -1652,20 +1854,7 @@ def main():
 
         current_phase = "phase1"
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                ),
-                locale="ja-JP",
-            )
-            context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-            )
+            browser, context = _make_browser_context(p)
             pg = context.new_page()
             try:
                 new_items, phase1_diag = scrape_listing(
@@ -1763,20 +1952,7 @@ def main():
             passed2_ids = {x["id"] for x in passed2}
             items_for_detail = [x for x in new_items if x["id"] in passed2_ids]
             with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
-                context = browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                    ),
-                    locale="ja-JP",
-                )
-                context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-                )
+                browser, context = _make_browser_context(p)
                 pg = context.new_page()
                 try:
                     detailed_items = scrape_detail(pg, items_for_detail, detail_cfg)
