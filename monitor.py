@@ -783,8 +783,77 @@ def validate_json_list(text, required_fields, phase_tag, pass_field=None):
     return data
 
 
+def _pass_value_is_true(value):
+    if value is True:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return False
+
+
 def filter_passed(items, pass_field):
-    return [x for x in items if x.get(pass_field) is True]
+    field = (pass_field or "pass").strip()
+    return [x for x in items if _pass_value_is_true(x.get(field))]
+
+
+def _extract_summary_panel(page, panel_cfg):
+    root = (panel_cfg or {}).get("root") or ""
+    column = (panel_cfg or {}).get("column") or ""
+    if not root or not column:
+        return {}
+    try:
+        return page.evaluate(
+            """
+            (args) => {
+                const out = {};
+                const root = document.querySelector(args.root);
+                if (!root) return out;
+                root.querySelectorAll(args.column).forEach((col) => {
+                    const ps = [...col.querySelectorAll('p')]
+                        .map((p) => (p.innerText || '').trim())
+                        .filter(Boolean);
+                    if (ps.length >= 2) {
+                        out[ps[0]] = ps[1];
+                    }
+                });
+                return out;
+            }
+            """,
+            {"root": root, "column": column},
+        ) or {}
+    except Exception:
+        return {}
+
+
+def _merge_party_context(merge_cfg, dl_pairs, panel_data, rating_label):
+    if not merge_cfg:
+        return None
+    sep = merge_cfg.get("sep", "; ")
+    segments = merge_cfg.get("segments") or []
+    parts = []
+    for seg in segments:
+        seg_type = seg.get("type")
+        fmt = seg.get("fmt", "{value}")
+        if seg_type == "dl":
+            dt = seg.get("dt") or ""
+            value = (dl_pairs or {}).get(dt, "")
+            if value:
+                parts.append(fmt.replace("{value}", value).replace("{key}", dt))
+        elif seg_type == "panel":
+            keys = seg.get("keys")
+            items = panel_data or {}
+            iter_keys = keys if keys else list(items.keys())
+            for key in iter_keys:
+                value = items.get(key)
+                if value:
+                    parts.append(
+                        fmt.replace("{value}", value).replace("{key}", key),
+                    )
+    merged = sep.join(p for p in parts if p)
+    if merged:
+        return merged
+    fallback = (merge_cfg.get("fallback") or "").strip()
+    return fallback or None
 
 
 def merge_items_by_id(*item_lists):
@@ -837,7 +906,7 @@ def _build_slim_list(items, keys, proposal_key=None):
 def _format_notify_entries(items, notify_field_specs, url_template, pass_field=None, pass_threshold=None):
     blocks_body = []
     for entry in items:
-        if pass_field and entry.get(pass_field) is not True:
+        if pass_field and not _pass_value_is_true(entry.get((pass_field or "pass").strip())):
             continue
         if pass_threshold is not None:
             score = entry.get("score", entry.get("safety_score", 0))
@@ -1669,44 +1738,58 @@ def _scrape_detail_dom(page, detail, detail_cfg):
     dt_dd_map = dom_desc_cfg.get("dt_dd_map") or {}
     desc_max = int(dom_desc_cfg.get("desc_max", 600))
     rating_label = detail_cfg.get("rating_label", "meta1")
-    if not dt_dd_map:
-        return detail
+    missing_context = (dom_desc_cfg.get("missing_context") or "N/A").strip()
+    dl_pairs = {}
     try:
-        extracted = page.evaluate(
-            """
-            (args) => {
-                const result = {};
-                for (const dl of document.querySelectorAll(args.dlSelector)) {
-                    let lastDt = null;
-                    for (const el of dl.querySelectorAll("dt, dd")) {
-                        if (el.tagName === "DT") {
-                            lastDt = (el.innerText || "").trim();
-                        } else if (el.tagName === "DD" && lastDt !== null) {
-                            if (args.dtDdMap[lastDt] && !result[args.dtDdMap[lastDt]]) {
-                                result[args.dtDdMap[lastDt]] = (el.innerText || "").trim();
+        if dt_dd_map:
+            extracted = page.evaluate(
+                """
+                (args) => {
+                    const mapped = {};
+                    const pairs = {};
+                    for (const dl of document.querySelectorAll(args.dlSelector)) {
+                        let lastDt = null;
+                        for (const el of dl.querySelectorAll("dt, dd")) {
+                            if (el.tagName === "DT") {
+                                lastDt = (el.innerText || "").trim();
+                            } else if (el.tagName === "DD" && lastDt !== null) {
+                                const value = (el.innerText || "").trim();
+                                pairs[lastDt] = value;
+                                if (args.dtDdMap[lastDt] && !mapped[args.dtDdMap[lastDt]]) {
+                                    mapped[args.dtDdMap[lastDt]] = value;
+                                }
+                                lastDt = null;
                             }
-                            lastDt = null;
                         }
                     }
+                    return { mapped, pairs };
                 }
-                return result;
-            }
-            """,
-            {"dlSelector": dl_sel, "dtDdMap": dt_dd_map},
+                """,
+                {"dlSelector": dl_sel, "dtDdMap": dt_dd_map},
+            ) or {}
+            mapped = extracted.get("mapped") or {}
+            dl_pairs = extracted.get("pairs") or {}
+            for src_field, value in mapped.items():
+                if src_field == "description":
+                    detail["description"] = (value or detail.get("description", ""))[:desc_max]
+                elif src_field == "price":
+                    if value:
+                        detail["price"] = value
+                else:
+                    detail[src_field] = value
+        panel_data = _extract_summary_panel(page, dom_desc_cfg.get("summary_panel"))
+        merge_cfg = dom_desc_cfg.get("context_merge") or {}
+        merge_target = (merge_cfg.get("target") or rating_label).strip()
+        merged_context = _merge_party_context(
+            merge_cfg, dl_pairs, panel_data, rating_label,
         )
-        for src_field, value in (extracted or {}).items():
-            if src_field == "description":
-                detail["description"] = (value or detail.get("description", ""))[:desc_max]
-            elif src_field == "price":
-                if value:
-                    detail["price"] = value
-            else:
-                detail[src_field] = value
-        if rating_label not in detail:
-            detail[rating_label] = "N/A"
+        if merged_context:
+            detail[merge_target] = merged_context
+        elif merge_target not in detail:
+            detail[merge_target] = missing_context
     except Exception:
         if rating_label not in detail:
-            detail[rating_label] = "N/A"
+            detail[rating_label] = missing_context
     return detail
 
 
@@ -1799,8 +1882,8 @@ def main():
         )
         NOTIFY_PHASE6_HEADER = os.environ.get("NOTIFY_PHASE6_HEADER", "")
         NOTIFY_PHASE7_HEADER = os.environ.get("NOTIFY_PHASE7_HEADER", "")
-        PHASE2_PASS_FIELD = os.environ.get("PHASE2_PASS_FIELD", "pass")
-        PHASE4_PASS_FIELD = os.environ.get("PHASE4_PASS_FIELD", "pass")
+        PHASE2_PASS_FIELD = (os.environ.get("PHASE2_PASS_FIELD") or "pass").strip()
+        PHASE4_PASS_FIELD = (os.environ.get("PHASE4_PASS_FIELD") or "pass").strip()
         NOTIFY_HEADER = os.environ.get("NOTIFY_HEADER", "New results")
         NOTIFY_NO_NEW_HEADER = os.environ.get("NOTIFY_NO_NEW_HEADER", "No new items")
         NOTIFY_SEED_HEADER = os.environ.get("NOTIFY_SEED_HEADER", "Initial seed done")
@@ -2251,7 +2334,7 @@ def main():
 
         notified_count = 0
         for entry in result5:
-            if entry.get(notify_pass_field) is not True:
+            if not _pass_value_is_true(entry.get((notify_pass_field or "pass").strip())):
                 continue
             score = entry.get("score", entry.get("safety_score", 0))
             if not isinstance(score, (int, float)) or score < PASS_THRESHOLD:
