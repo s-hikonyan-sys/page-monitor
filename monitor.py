@@ -763,8 +763,42 @@ def _normalize_gemini_item(item, required_fields):
     return normalized
 
 
-def validate_json_list(text, required_fields, phase_tag, pass_field=None):
+def _backfill_items_from_source(items, source_items, fields):
+    if not items or not source_items or not fields:
+        return items
+    by_id = {}
+    for src in source_items:
+        if not isinstance(src, dict):
+            continue
+        src_id = src.get("id")
+        if src_id is not None:
+            by_id[str(src_id)] = src
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
+        if item_id is None:
+            continue
+        src = by_id.get(str(item_id))
+        if not src:
+            continue
+        for field in fields:
+            if field not in item and field in src:
+                item[field] = src[field]
+    return items
+
+
+def validate_json_list(
+    text,
+    required_fields,
+    phase_tag,
+    pass_field=None,
+    source_items=None,
+    source_fields=None,
+):
     data = _parse_gemini_json_array(text, phase_tag)
+    if source_items and source_fields:
+        _backfill_items_from_source(data, source_items, source_fields)
     for i, item in enumerate(data):
         if not isinstance(item, dict):
             raise ValueError(f"[{phase_tag}] Item [{i}] is not an object")
@@ -2054,7 +2088,12 @@ def main():
             last_gemini_raw = raw
             gemini_calls += 1
             result4 = validate_json_list(
-                raw, phase4_fields, current_phase, pass_field=PHASE4_PASS_FIELD,
+                raw,
+                phase4_fields,
+                current_phase,
+                pass_field=PHASE4_PASS_FIELD,
+                source_items=detailed_items,
+                source_fields=("id", "title", "url", "meta1"),
             )
             partial_result = result4
             result4_merged = merge_items_by_id(detailed_items, result4)
