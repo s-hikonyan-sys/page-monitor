@@ -1393,8 +1393,10 @@ def format_phase1_seed(diag, seeded_count):
 
 def _make_browser_context(p):
     """Chromium ブラウザ + コンテキストを生成する"""
+    _outbound_relay = os.environ.get("BROWSER_PROXY") or None
     browser = p.chromium.launch(
         headless=True,
+        proxy={"server": _outbound_relay} if _outbound_relay else None,
         args=[
             "--disable-blink-features=AutomationControlled",
             "--disable-dev-shm-usage",

@@ -37,9 +37,24 @@ jobs:
           pip install .
           python -m playwright install chromium --with-deps
 
+      - name: Open outbound relay
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PROD_SSH_PRIVATE_KEY }}" > ~/.ssh/relay_key
+          chmod 600 ~/.ssh/relay_key
+          echo "${{ secrets.PROD_SSH_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
+          ssh -i ~/.ssh/relay_key \
+              -o StrictHostKeyChecking=no \
+              -o ServerAliveInterval=30 \
+              -o ExitOnForwardFailure=yes \
+              -D 1080 -f -N \
+              "${{ vars.PROD_SSH_USER }}@${{ vars.PROD_HOST }}"
+          sleep 3
+
       - name: Run Pipeline
         env:
           STATE_SUFFIX: "_2"
+          BROWSER_PROXY: "socks5://localhost:1080"
           TARGET_URL: ${{ secrets.TARGET_URL_2 }}
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL_2 }}
