@@ -336,7 +336,7 @@ _PM_REVIEW_INPUT_KEYS = (
     "id", "description", "meta1", "work_estimate", "delivery_text",
     "proposal_text", "technical_requirements", "implementation_challenges",
 )
-_BUYER_REVIEW_KEYS = ("id", "title", "description", "meta1", "proposal_text")
+_PARTY_REVIEW_KEYS = ("id", "title", "description", "meta1", "proposal_text")
 _REVISION_INPUT_KEYS = (
     "id", "title", "description", "meta1", "delivery_text", "proposal_text",
     "risk_revision_guidance", "revision_guidance",
@@ -494,7 +494,7 @@ def format_run_summary(exit_reason, **ctx):
         ])
     if ctx.get("phase5b") is not None:
         lines.extend([
-            "Phase5-B (buyer):",
+            "Phase5-B (review-b):",
             f"  items: {ctx['phase5b']}",
             "",
         ])
@@ -512,7 +512,7 @@ def format_run_summary(exit_reason, **ctx):
         ])
     if ctx.get("phase7b") is not None:
         lines.extend([
-            "Phase7-B (final buyer):",
+            "Phase7-B (final review-b):",
             f"  items: {ctx['phase7b']}",
             "",
         ])
@@ -865,7 +865,103 @@ def _extract_summary_panel(page, panel_cfg):
         return {}
 
 
-def _merge_party_context(merge_cfg, dl_pairs, panel_data, rating_label):
+def _detail_page_url(url, detail_cfg):
+    nav = detail_cfg.get("detail_nav") or {}
+    query = (nav.get("query") or "").strip()
+    if not query:
+        return url
+    key = query.split("=", 1)[0]
+    if f"{key}=" in url:
+        return url
+    if "?" in url:
+        return f"{url}&{query}"
+    return f"{url}?{query}"
+
+
+def _extract_party_panel(page, party_cfg):
+    if not party_cfg:
+        return {}
+    style = (party_cfg.get("style") or "").strip()
+    try:
+        if style == "grid_auth":
+            return page.evaluate(
+                """
+                (cfg) => {
+                    const out = {};
+                    const root = document.querySelector(cfg.root);
+                    if (!root) return out;
+                    root.querySelectorAll(cfg.column).forEach((col) => {
+                        const heading = col.querySelector(cfg.heading);
+                        const value = col.querySelector(cfg.value);
+                        const h = (heading?.innerText || '').trim();
+                        const v = (value?.innerText || '').trim();
+                        if (h && v) out[h] = v;
+                    });
+                    const authRoot = document.querySelector(cfg.auth_root);
+                    if (authRoot) {
+                        authRoot.querySelectorAll(cfg.auth_row).forEach((row) => {
+                            const h = (row.querySelector(cfg.auth_heading)?.innerText || '').trim();
+                            if (!h) return;
+                            const done = !!row.querySelector(cfg.auth_done);
+                            (cfg.auth_flags || []).forEach((flag) => {
+                                const alt = flag.heading_alt || '';
+                                if (h.includes(flag.heading_match) || (alt && h.includes(alt))) {
+                                    out[flag.key] = done ? '済' : '未';
+                                }
+                            });
+                        });
+                    }
+                    return out;
+                }
+                """,
+                party_cfg,
+            ) or {}
+        if style == "party_feedback":
+            return page.evaluate(
+                """
+                (cfg) => {
+                    const out = {};
+                    const root = document.querySelector(cfg.root);
+                    if (!root) return out;
+                    const good = (root.querySelector(cfg.good)?.innerText || '').trim();
+                    const bad = (root.querySelector(cfg.bad)?.innerText || '').trim();
+                    if (good !== '') out.good = good;
+                    if (bad !== '') out.bad = bad;
+                    if (good !== '' || bad !== '') {
+                        out.eval_goodbad = `Good${good || '0'}/Bad${bad || '0'}`;
+                    }
+                    const rate = (root.querySelector(cfg.rate)?.innerText || '').trim();
+                    if (rate) out.order_rate = rate;
+                    const awarded = (root.querySelector(cfg.awarded)?.innerText || '').trim();
+                    const posted = (root.querySelector(cfg.posted)?.innerText || '').trim();
+                    if (awarded && posted) out.order_count = `${awarded}/${posted}`;
+                    const auths = [];
+                    root.querySelectorAll(cfg.auth_row).forEach((row) => {
+                        const label = (row.querySelector(cfg.auth_label)?.innerText || '').trim();
+                        if (!label) return;
+                        const dt = row.querySelector('dt');
+                        const done = !!dt && (
+                            !!dt.querySelector('i.c-icon') || dt.textContent.trim() === '--'
+                        );
+                        if (done) auths.push(label.replace(/確認$/, ''));
+                        (cfg.auth_flags || []).forEach((flag) => {
+                            if (label.includes(flag.label_match)) {
+                                out[flag.key] = done ? '済' : '未';
+                            }
+                        });
+                    });
+                    if (auths.length) out.auth_list = auths.join(',');
+                    return out;
+                }
+                """,
+                party_cfg,
+            ) or {}
+    except Exception:
+        return {}
+    return {}
+
+
+def _merge_party_context(merge_cfg, dl_pairs, panel_data, party_data, rating_label):
     if not merge_cfg:
         return None
     sep = merge_cfg.get("sep", "; ")
@@ -889,11 +985,45 @@ def _merge_party_context(merge_cfg, dl_pairs, panel_data, rating_label):
                     parts.append(
                         fmt.replace("{value}", value).replace("{key}", key),
                     )
+        elif seg_type == "party":
+            key = seg.get("key") or ""
+            pdata = party_data or {}
+            value = pdata.get(key, "")
+            if value:
+                rendered = fmt.replace("{value}", str(value)).replace("{key}", key)
+                rendered = rendered.replace("{good}", str(pdata.get("good", "")))
+                rendered = rendered.replace("{bad}", str(pdata.get("bad", "")))
+                parts.append(rendered)
     merged = sep.join(p for p in parts if p)
     if merged:
         return merged
     fallback = (merge_cfg.get("fallback") or "").strip()
     return fallback or None
+
+
+def _apply_detail_context_merge(
+    detail, dom_desc_cfg, dl_pairs, panel_data, party_data, rating_label,
+):
+    merge_cfg = dom_desc_cfg.get("context_merge") or {}
+    if not merge_cfg:
+        return detail
+    merge_target = (merge_cfg.get("target") or rating_label).strip()
+    missing_context = (dom_desc_cfg.get("missing_context") or "N/A").strip()
+    mode = (merge_cfg.get("mode") or "replace").strip()
+    merged = _merge_party_context(
+        merge_cfg, dl_pairs, panel_data, party_data, rating_label,
+    )
+    if not merged:
+        if merge_target not in detail:
+            detail[merge_target] = missing_context
+        return detail
+    existing = detail.get(merge_target)
+    if mode == "append" and existing and str(existing).strip() not in ("", "N/A"):
+        sep = merge_cfg.get("sep", "; ")
+        detail[merge_target] = f"{existing}{sep}{merged}"
+    else:
+        detail[merge_target] = merged
+    return detail
 
 
 def merge_items_by_id(*item_lists):
@@ -1832,19 +1962,26 @@ def _scrape_detail_dom(page, detail, detail_cfg):
                 else:
                     detail[src_field] = value
         panel_data = _extract_summary_panel(page, dom_desc_cfg.get("summary_panel"))
-        merge_cfg = dom_desc_cfg.get("context_merge") or {}
-        merge_target = (merge_cfg.get("target") or rating_label).strip()
-        merged_context = _merge_party_context(
-            merge_cfg, dl_pairs, panel_data, rating_label,
+        party_data = _extract_party_panel(page, dom_desc_cfg.get("party_panel"))
+        detail = _apply_detail_context_merge(
+            detail, dom_desc_cfg, dl_pairs, panel_data, party_data, rating_label,
         )
-        if merged_context:
-            detail[merge_target] = merged_context
-        elif merge_target not in detail:
-            detail[merge_target] = missing_context
     except Exception:
         if rating_label not in detail:
             detail[rating_label] = missing_context
     return detail
+
+
+def _enrich_detail_dom_context(page, detail, detail_cfg):
+    dom_desc_cfg = detail_cfg.get("dom_desc") or {}
+    if not dom_desc_cfg:
+        return detail
+    rating_label = detail_cfg.get("rating_label", "meta1")
+    panel_data = _extract_summary_panel(page, dom_desc_cfg.get("summary_panel"))
+    party_data = _extract_party_panel(page, dom_desc_cfg.get("party_panel"))
+    return _apply_detail_context_merge(
+        detail, dom_desc_cfg, {}, panel_data, party_data, rating_label,
+    )
 
 
 def scrape_detail(page, items, detail_cfg):
@@ -1860,7 +1997,8 @@ def scrape_detail(page, items, detail_cfg):
     for item in items:
         detail = dict(item)
         try:
-            page.goto(item["url"], wait_until="domcontentloaded", timeout=30000)
+            page_url = _detail_page_url(item["url"], detail_cfg)
+            page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(3000)
             ld_matched = False
             if ld_type or desc_path or rv_path or rc_path or price_path:
@@ -1892,8 +2030,11 @@ def scrape_detail(page, items, detail_cfg):
                         break
                     except Exception:
                         continue
-            if use_dom_desc and not ld_matched:
-                detail = _scrape_detail_dom(page, detail, detail_cfg)
+            if use_dom_desc:
+                if ld_matched:
+                    detail = _enrich_detail_dom_context(page, detail, detail_cfg)
+                else:
+                    detail = _scrape_detail_dom(page, detail, detail_cfg)
         except Exception:
             detail[rating_label] = "N/A"
         results.append(detail)
@@ -2191,10 +2332,10 @@ def main():
             {"label": "提案文（初稿）", "key": "proposal_text_draft"},
             {"label": "リスクスコア", "key": "risk_score"},
             {"label": "リスク所見", "key": "risk_findings"},
-            {"label": "修正指示（5-A・発注者向け）", "key": "risk_revision_guidance"},
+            {"label": "修正指示（5-A）", "key": "risk_revision_guidance"},
             {"label": "備考（5-A・修正に使わない）", "key": "risk_advisory_notes"},
             {"label": "受注期待度", "key": "reception_score"},
-            {"label": "発注者の背景", "key": "buyer_pain_point"},
+            {"label": "背景（5-B）", "key": "buyer_pain_point"},
             {"label": "信頼できる点", "key": "credibility_good"},
             {"label": "不安要素", "key": "credibility_bad"},
             {"label": "修正指示（5-B）", "key": "revision_guidance"},
@@ -2212,7 +2353,7 @@ def main():
             {"label": "最終リスクスコア", "key": "final_risk_score"},
             {"label": "最終リスク所見", "key": "final_risk_findings"},
             {"label": "最終受注期待度", "key": "final_reception_score"},
-            {"label": "最終・発注者背景", "key": "final_buyer_pain_point"},
+            {"label": "最終・背景（5-B）", "key": "final_buyer_pain_point"},
             {"label": "最終・信頼できる点", "key": "final_credibility_good"},
             {"label": "最終・不安要素", "key": "final_credibility_bad"},
         ]
@@ -2265,10 +2406,10 @@ def main():
                 current_phase = "phase5-b"
                 _log_progress(f"phase5-b start items={len(result5_merged)}")
                 review_b_fields = _parse_csv_fields(PHASE5_REVIEW_B_FIELDS)
-                buyer_input = _build_slim_list(result5_merged, _BUYER_REVIEW_KEYS)
+                party_review_input = _build_slim_list(result5_merged, _PARTY_REVIEW_KEYS)
                 raw = call_gemini(
                     KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
-                    build_phase_prompt("", PROMPT_PHASE5_REVIEW_B, buyer_input),
+                    build_phase_prompt("", PROMPT_PHASE5_REVIEW_B, party_review_input),
                     GEMINI_MODEL,
                 )
                 last_gemini_raw = raw
@@ -2361,10 +2502,10 @@ def main():
                 current_phase = "phase7-b"
                 _log_progress(f"phase7-b start items={len(result5)}")
                 phase7b_fields = _parse_csv_fields(PHASE7_REVIEW_B_FIELDS)
-                buyer7_input = _build_slim_list(result5, _BUYER_REVIEW_KEYS)
+                party_review7_input = _build_slim_list(result5, _PARTY_REVIEW_KEYS)
                 raw = call_gemini(
                     KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
-                    build_phase_prompt("", PROMPT_PHASE7_REVIEW_B, buyer7_input),
+                    build_phase_prompt("", PROMPT_PHASE7_REVIEW_B, party_review7_input),
                     GEMINI_MODEL,
                 )
                 last_gemini_raw = raw
