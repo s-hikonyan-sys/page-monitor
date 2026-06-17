@@ -211,10 +211,16 @@ def send_info_to_slack(webhook_url, header, body):
 
 
 def secure_exit():
+    _log_progress("run exit status=1")
     sys.exit(1)
 
 
+def _log_progress(message):
+    print(f"[monitor] {message}", flush=True)
+
+
 def finish_run(webhook_url, header, body):
+    _log_progress("run complete status=0")
     send_info_to_slack(webhook_url, header, body)
     sys.exit(0)
 
@@ -1621,7 +1627,18 @@ def _load_page_with_settle(context, page, url, goto_wait, config, diagnostics, p
                 diagnostics["errors"].append(
                     f"page {page_num}: runtime settle ok on round {round_num}",
                 )
+                _log_progress(
+                    f"phase1 settle done page={page_num} round={round_num}",
+                )
             return page, response
+        if round_num == 1:
+            _log_progress(
+                f"phase1 settle start page={page_num} max_rounds={max_rounds}",
+            )
+        elif round_num == 2:
+            _log_progress(
+                f"phase1 settle retry page={page_num} (up to {max_rounds} rounds)",
+            )
         if round_num <= max_rounds:
             diagnostics["errors"].append(
                 f"page {page_num}: runtime settle round {round_num}/{max_rounds}",
@@ -1631,6 +1648,9 @@ def _load_page_with_settle(context, page, url, goto_wait, config, diagnostics, p
         else:
             diagnostics["errors"].append(
                 f"page {page_num}: runtime settle exhausted ({max_rounds} rounds)",
+            )
+            _log_progress(
+                f"phase1 settle exhausted page={page_num} rounds={max_rounds}",
             )
     return page, response
 
@@ -1963,6 +1983,7 @@ def main():
 
         parse_cfg = json.loads(PARSE_CONFIG)
         notify_fields = json.loads(NOTIFY_FIELDS)
+        _log_progress("init done")
         NOTIFY_URL_TEMPLATE = os.environ.get("NOTIFY_URL_TEMPLATE", "") or (
             (parse_cfg.get("page_state") or {}).get("url_template", "")
         )
@@ -1972,6 +1993,7 @@ def main():
         phase1_diag = _empty_phase1_diagnostics(seen_ids)
 
         current_phase = "phase1"
+        _log_progress("phase1 start")
         with sync_playwright() as p:
             browser, context = _make_browser_context(p)
             pg = context.new_page()
@@ -1982,9 +2004,13 @@ def main():
             finally:
                 browser.close()
 
+        _log_progress(
+            f"phase1 done scraped={phase1_diag['scraped_total']} new={len(new_items)}",
+        )
         url_by_id = _url_by_id_from_items(new_items)
 
         if phase1_diag["scraped_total"] == 0:
+            _log_progress("phase1 failed scraped=0")
             send_error_to_slack(
                 SLACK_WEBHOOK_URL,
                 format_phase1_scrape_failure(phase1_diag),
@@ -1993,6 +2019,7 @@ def main():
             secure_exit()
 
         if not new_items:
+            _log_progress("phase1 done no new items")
             finish_run(
                 SLACK_WEBHOOK_URL,
                 NOTIFY_NO_NEW_HEADER,
@@ -2007,6 +2034,7 @@ def main():
             )
 
         if _is_initial_seed_run():
+            _log_progress(f"phase1 seed items={len(new_items)}")
             for item in new_items:
                 seen_ids.add(item["id"])
             seen_saved = _maybe_save_seen_ids(seen_ids)
@@ -2026,6 +2054,7 @@ def main():
 
         if PROMPT_PHASE2:
             current_phase = "phase2"
+            _log_progress(f"phase2 start items={len(new_items)}")
             phase2_fields = [f.strip() for f in PHASE2_FIELDS.split(",") if f.strip()]
             raw = call_gemini(
                 KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
@@ -2039,6 +2068,7 @@ def main():
             )
             partial_result = result2
             passed2 = filter_passed(result2, PHASE2_PASS_FIELD)
+            _log_progress(f"phase2 done passed={len(passed2)}")
             if not passed2:
                 for item in new_items:
                     seen_ids.add(item["id"])
@@ -2070,6 +2100,7 @@ def main():
             detail_cfg = json.loads(DETAIL_CONFIG)
             passed2_ids = {x["id"] for x in passed2}
             items_for_detail = [x for x in new_items if x["id"] in passed2_ids]
+            _log_progress(f"phase3 start items={len(items_for_detail)}")
             with sync_playwright() as p:
                 browser, context = _make_browser_context(p)
                 pg = context.new_page()
@@ -2078,7 +2109,9 @@ def main():
                 finally:
                     browser.close()
 
+            _log_progress(f"phase3 done detailed={len(detailed_items)}")
             current_phase = "phase4"
+            _log_progress(f"phase4 start items={len(detailed_items)}")
             phase4_fields = [f.strip() for f in PHASE4_FIELDS.split(",") if f.strip()]
             raw = call_gemini(
                 KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
@@ -2098,6 +2131,7 @@ def main():
             partial_result = result4
             result4_merged = merge_items_by_id(detailed_items, result4)
             passed4 = filter_passed(result4_merged, PHASE4_PASS_FIELD)
+            _log_progress(f"phase4 done passed={len(passed4)}")
             if not passed4:
                 for item in new_items:
                     seen_ids.add(item["id"])
@@ -2189,6 +2223,7 @@ def main():
             proposal_input = _build_slim_list(passed4, _PROPOSAL_INPUT_KEYS)
 
             current_phase = "phase5-draft"
+            _log_progress(f"phase5-draft start items={len(proposal_input)}")
             raw = call_gemini(
                 KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
                 build_phase_prompt(
@@ -2204,10 +2239,12 @@ def main():
             url_by_id = {**url_by_id, **_url_by_id_from_items(result5_merged)}
             phase5_draft_count = len(result5_merged)
             partial_result = result5_merged
+            _log_progress(f"phase5-draft done items={phase5_draft_count}")
 
             result5a_list = []
             if PROMPT_PHASE5_REVIEW_A:
                 current_phase = "phase5-a"
+                _log_progress(f"phase5-a start items={len(result5_merged)}")
                 review_a_fields = _parse_csv_fields(PHASE5_REVIEW_A_FIELDS)
                 pm_input = _build_slim_list(result5_merged, _PM_REVIEW_INPUT_KEYS)
                 raw = call_gemini(
@@ -2221,10 +2258,12 @@ def main():
                 gemini_calls += 1
                 result5a_list = validate_json_list(raw, review_a_fields, current_phase)
                 phase5a_count = len(result5a_list)
+                _log_progress(f"phase5-a done items={phase5a_count}")
 
             result5b_list = []
             if PROMPT_PHASE5_REVIEW_B:
                 current_phase = "phase5-b"
+                _log_progress(f"phase5-b start items={len(result5_merged)}")
                 review_b_fields = _parse_csv_fields(PHASE5_REVIEW_B_FIELDS)
                 buyer_input = _build_slim_list(result5_merged, _BUYER_REVIEW_KEYS)
                 raw = call_gemini(
@@ -2236,6 +2275,7 @@ def main():
                 gemini_calls += 1
                 result5b_list = validate_json_list(raw, review_b_fields, current_phase)
                 phase5b_count = len(result5b_list)
+                _log_progress(f"phase5-b done items={phase5b_count}")
 
             result5 = merge_items_by_id(
                 result5_merged,
@@ -2263,6 +2303,7 @@ def main():
 
             if PROMPT_PHASE6_REVISION:
                 current_phase = "phase6"
+                _log_progress(f"phase6 start items={len(result5)}")
                 phase6_fields = _parse_csv_fields(PHASE6_FIELDS)
                 revision_input = _build_slim_list(result5, _REVISION_INPUT_KEYS)
                 raw = call_gemini(
@@ -2278,6 +2319,7 @@ def main():
                 _enrich_items_urls(result6_list, url_by_id, NOTIFY_URL_TEMPLATE)
                 phase6_count = len(result6_list)
                 result5 = merge_items_by_id(result5, result6_list)
+                _log_progress(f"phase6 done items={phase6_count}")
                 _enrich_items_urls(result5, url_by_id, NOTIFY_URL_TEMPLATE)
                 for item in result5:
                     if isinstance(item, dict) and not item.get("proposal_text_draft"):
@@ -2298,6 +2340,7 @@ def main():
             result7a_list = []
             if PROMPT_PHASE7_REVIEW_A:
                 current_phase = "phase7-a"
+                _log_progress(f"phase7-a start items={len(result5)}")
                 phase7a_fields = _parse_csv_fields(PHASE7_REVIEW_A_FIELDS)
                 phase7a_input = _build_slim_list(result5, _PHASE7A_INPUT_KEYS)
                 raw = call_gemini(
@@ -2311,10 +2354,12 @@ def main():
                 gemini_calls += 1
                 result7a_list = validate_json_list(raw, phase7a_fields, current_phase)
                 phase7a_count = len(result7a_list)
+                _log_progress(f"phase7-a done items={phase7a_count}")
 
             result7b_list = []
             if PROMPT_PHASE7_REVIEW_B:
                 current_phase = "phase7-b"
+                _log_progress(f"phase7-b start items={len(result5)}")
                 phase7b_fields = _parse_csv_fields(PHASE7_REVIEW_B_FIELDS)
                 buyer7_input = _build_slim_list(result5, _BUYER_REVIEW_KEYS)
                 raw = call_gemini(
@@ -2326,6 +2371,7 @@ def main():
                 gemini_calls += 1
                 result7b_list = validate_json_list(raw, phase7b_fields, current_phase)
                 phase7b_count = len(result7b_list)
+                _log_progress(f"phase7-b done items={phase7b_count}")
 
             if result7a_list or result7b_list:
                 result5 = merge_items_by_id(result5, result7a_list, result7b_list)
@@ -2352,6 +2398,7 @@ def main():
         seen_ids_after = len(seen_ids)
 
         if not result5:
+            _log_progress("phase5 empty")
             finish_run(
                 SLACK_WEBHOOK_URL,
                 NOTIFY_PHASE5_EMPTY_HEADER,
@@ -2409,6 +2456,9 @@ def main():
             url_by_id=url_by_id,
         )
 
+        _log_progress(
+            f"run summary notified={notified_count} gemini_calls={gemini_calls}",
+        )
         if notified_count > 0:
             header = NOTIFY_SUCCESS_SUMMARY_HEADER or "Run complete"
             send_info_to_slack(SLACK_WEBHOOK_URL, header, summary_body)
@@ -2419,6 +2469,8 @@ def main():
 
     except Exception:
         error_msg = traceback.format_exc()
+        _log_progress(f"run failed phase={current_phase}")
+        traceback.print_exc()
         send_error_to_slack(
             SLACK_WEBHOOK_URL,
             error_msg,
