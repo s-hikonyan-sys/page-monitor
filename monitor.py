@@ -1140,6 +1140,14 @@ def _context_scoring_unavailable(metrics, profile):
     return False
 
 
+def _auth_bonus_eligible(orders, reviews, cfg):
+    min_orders_auth = int(cfg.get("min_orders_auth", 3))
+    min_reviews_auth = int(cfg.get("min_reviews_auth", 5))
+    order_count = 0 if orders is None else int(orders)
+    review_count = 0 if reviews is None else int(reviews)
+    return order_count >= min_orders_auth or review_count >= min_reviews_auth
+
+
 def _party_score_rating_baseline(metrics, cfg):
     total = 0
     parts = []
@@ -1150,8 +1158,26 @@ def _party_score_rating_baseline(metrics, cfg):
     rating = metrics.get("rating")
     reviews = metrics.get("review_count")
     orders = metrics.get("order_total")
+    order_rate = metrics.get("order_rate_pct")
+    completion = metrics.get("completion_rate_pct")
 
-    rating_adj = 0
+    if orders is not None:
+        if orders == 0:
+            total -= 10
+            parts.append("first-10")
+        elif 1 <= orders <= 3:
+            total -= 5
+            parts.append("loword-5")
+
+    if (
+        rating is not None
+        and reviews is not None
+        and reviews >= min_reviews
+        and rating < 4.5
+    ):
+        total -= 12
+        parts.append("★-12")
+
     if (
         rating is not None
         and reviews is not None
@@ -1162,34 +1188,35 @@ def _party_score_rating_baseline(metrics, cfg):
         delta = rating - baseline
         if delta >= 0:
             rating_adj = min(15, round(delta * delta * 200))
-        elif rating < 4.5 and reviews >= min_reviews:
-            rating_adj = max(-15, -round((4.5 - rating) ** 2 * 80))
-        total += rating_adj
-        if rating_adj:
-            parts.append(f"★{rating_adj:+d}")
+            total += rating_adj
+            if rating_adj:
+                parts.append(f"★{rating_adj:+d}")
 
-    if metrics.get("id_verify") == "済":
-        total += 2
-        parts.append("id+2")
-    if metrics.get("nda") == "済":
-        total += 2
-        parts.append("nda+2")
-    order_rate = metrics.get("order_rate_pct")
-    if order_rate is not None and order_rate >= 70:
-        total += 2
-        parts.append("orate+2")
-    completion = metrics.get("completion_rate_pct")
-    if completion is not None and completion >= 85:
-        total += 2
-        parts.append("comp+2")
-
-    if orders is not None and orders >= 10:
-        if completion is not None and completion < 40:
+    if orders is not None and orders >= 5:
+        if completion is not None and completion < 75:
             total -= 10
             parts.append("comp-10")
-        if order_rate is not None and order_rate < 30:
+        if orders >= 10 and completion is not None and completion < 60:
+            total -= 5
+            parts.append("comp-5")
+        if order_rate is not None and order_rate < 50:
             total -= 5
             parts.append("orate-5")
+
+    if _auth_bonus_eligible(orders, reviews, cfg):
+        if metrics.get("id_verify") == "済":
+            total += 2
+            parts.append("id+2")
+        if metrics.get("nda") == "済":
+            total += 2
+            parts.append("nda+2")
+
+    if orders is not None and orders >= 5 and order_rate is not None and order_rate >= 70:
+        total += 2
+        parts.append("orate+2")
+    if orders is not None and orders >= 10 and completion is not None and completion >= 85:
+        total += 2
+        parts.append("comp+2")
 
     return total, "+".join(parts) if parts else "0"
 
@@ -1203,35 +1230,55 @@ def _party_score_ratio_baseline(metrics, cfg):
     good = int(metrics.get("good") or 0)
     bad = int(metrics.get("bad") or 0)
     feedback_total = good + bad
-    ratio_adj = 0
+    order_rate = metrics.get("order_rate_pct")
+    awarded = metrics.get("order_awarded")
+    posted = metrics.get("order_posted")
+
+    if posted is not None and posted >= 3 and (awarded is None or awarded == 0):
+        total -= 10
+        parts.append("first-10")
+
+    if (
+        posted is not None
+        and posted >= 5
+        and order_rate is not None
+        and order_rate < 35
+    ):
+        total -= 5
+        parts.append("orate-5")
+
     if feedback_total >= min_feedback:
         ratio = good / feedback_total
         delta = ratio - baseline
         if delta >= 0:
             ratio_adj = min(15, round(delta * delta * 3000))
+            total += ratio_adj
+            if ratio_adj:
+                parts.append(f"ratio{ratio_adj:+d}")
         elif ratio < 0.90:
             ratio_adj = max(-15, -round((0.90 - ratio) ** 2 * 500))
-        total += ratio_adj
-        if ratio_adj:
-            parts.append(f"ratio{ratio_adj:+d}")
+            total += ratio_adj
+            if ratio_adj:
+                parts.append(f"ratio{ratio_adj:+d}")
 
-    if metrics.get("id_verify") == "済":
-        total += 2
-        parts.append("id+2")
-    if metrics.get("nda") == "済":
-        total += 2
-        parts.append("nda+2")
-    order_rate = metrics.get("order_rate_pct")
+    auth_ok = (
+        (awarded is not None and awarded >= 3)
+        or feedback_total >= min_feedback
+    )
+    if auth_ok:
+        if metrics.get("id_verify") == "済":
+            total += 2
+            parts.append("id+2")
+        if metrics.get("nda") == "済":
+            total += 2
+            parts.append("nda+2")
+
     if order_rate is not None and order_rate >= 50:
         total += 2
         parts.append("orate+2")
-    awarded = metrics.get("order_awarded")
     if awarded is not None and awarded >= 10:
         total += 2
         parts.append("ord+2")
-        if order_rate is not None and order_rate < 20:
-            total -= 10
-            parts.append("orate-10")
 
     return total, "+".join(parts) if parts else "0"
 
@@ -1245,9 +1292,9 @@ def _compute_context_adjustment(metrics, scoring_cfg):
         total, breakdown = _party_score_ratio_baseline(metrics, scoring_cfg)
     else:
         total, breakdown = _party_score_rating_baseline(metrics, scoring_cfg)
-    clip = scoring_cfg.get("clip") or [-15, 20]
-    lo = int(clip[0]) if len(clip) > 0 else -15
-    hi = int(clip[1]) if len(clip) > 1 else 20
+    clip = scoring_cfg.get("clip") or [-20, 15]
+    lo = int(clip[0]) if len(clip) > 0 else -20
+    hi = int(clip[1]) if len(clip) > 1 else 15
     total = max(lo, min(hi, total))
     return total, breakdown
 
