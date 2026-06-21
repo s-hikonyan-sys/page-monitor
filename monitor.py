@@ -226,6 +226,8 @@ def finish_run(webhook_url, header, body):
 
 
 _SCORE_KEYS = ("screening_score", "safety_score", "score")
+_CTX_METRICS_KEY = "_ctx_metrics"
+_INTERNAL_SCRAPE_KEYS = frozenset({_CTX_METRICS_KEY})
 
 
 def _score_for_sort(item):
@@ -940,9 +942,7 @@ def _extract_party_panel(page, party_cfg):
                         const label = (row.querySelector(cfg.auth_label)?.innerText || '').trim();
                         if (!label) return;
                         const dt = row.querySelector('dt');
-                        const done = !!dt && (
-                            !!dt.querySelector('i.c-icon') || dt.textContent.trim() === '--'
-                        );
+                        const done = !!(dt && cfg.auth_done && dt.querySelector(cfg.auth_done));
                         if (done) auths.push(label.replace(/確認$/, ''));
                         (cfg.auth_flags || []).forEach((flag) => {
                             if (label.includes(flag.label_match)) {
@@ -959,6 +959,354 @@ def _extract_party_panel(page, party_cfg):
     except Exception:
         return {}
     return {}
+
+
+def _extract_rating_panel(page, rating_cfg):
+    if not rating_cfg:
+        return {}
+    try:
+        return page.evaluate(
+            """
+            (cfg) => {
+                const out = {};
+                const ratingEl = document.querySelector(cfg.rating);
+                const countEl = document.querySelector(cfg.count);
+                const rating = (ratingEl?.innerText || '').trim();
+                const countRaw = (countEl?.innerText || '').trim();
+                if (rating) out.rating = rating;
+                if (countRaw) out.review_count_raw = countRaw;
+                return out;
+            }
+            """,
+            rating_cfg,
+        ) or {}
+    except Exception:
+        return {}
+
+
+def _parse_float(value):
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _parse_int(value):
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    m = re.search(r"(\d+)", text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _parse_pct(value):
+    num = _parse_float(value)
+    if num is None:
+        return None
+    if "%" in str(value):
+        return num
+    if num <= 1.0:
+        return num * 100.0
+    return num
+
+
+def _parse_meta1_star(meta1):
+    if not meta1:
+        return None, None
+    text = str(meta1)
+    m = re.search(r"★([\d.]+).*?（(\d+)）", text)
+    if not m:
+        m = re.search(r"★([\d.]+).*?\((\d+)\)", text)
+    if not m:
+        return None, None
+    try:
+        return float(m.group(1)), int(m.group(2))
+    except ValueError:
+        return None, None
+
+
+def _normalize_ctx_metrics(party_data, rating_data, meta1):
+    party_data = party_data or {}
+    rating_data = rating_data or {}
+    metrics = {}
+
+    rating = _parse_float(rating_data.get("rating"))
+    review_count = _parse_int(rating_data.get("review_count_raw"))
+    if rating is None or review_count is None:
+        meta_rating, meta_reviews = _parse_meta1_star(meta1)
+        rating = rating if rating is not None else meta_rating
+        review_count = review_count if review_count is not None else meta_reviews
+    if rating is not None:
+        metrics["rating"] = rating
+    if review_count is not None:
+        metrics["review_count"] = review_count
+
+    for key in ("id_verify", "nda"):
+        if party_data.get(key) not in (None, ""):
+            metrics[key] = party_data.get(key)
+
+    if party_data.get("good") not in (None, ""):
+        metrics["good"] = _parse_int(party_data.get("good")) or 0
+    if party_data.get("bad") not in (None, ""):
+        metrics["bad"] = _parse_int(party_data.get("bad")) or 0
+
+    if party_data.get("order_rate") not in (None, ""):
+        metrics["order_rate_pct"] = _parse_pct(party_data.get("order_rate"))
+
+    for jp_key, field in (
+        ("発注件数", "order_total"),
+        ("発注率", "order_rate_pct"),
+        ("取引完了率", "completion_rate_pct"),
+    ):
+        if party_data.get(jp_key) not in (None, ""):
+            if field.endswith("_pct"):
+                metrics[field] = _parse_pct(party_data.get(jp_key))
+            else:
+                metrics[field] = _parse_int(party_data.get(jp_key))
+
+    awarded = _parse_int(party_data.get("awarded"))
+    posted = _parse_int(party_data.get("posted"))
+    if awarded is not None and posted is not None:
+        metrics["order_awarded"] = awarded
+        metrics["order_posted"] = posted
+
+    order_count = party_data.get("order_count")
+    if order_count and "order_awarded" not in metrics:
+        parts = str(order_count).split("/")
+        if len(parts) == 2:
+            metrics["order_awarded"] = _parse_int(parts[0])
+            metrics["order_posted"] = _parse_int(parts[1])
+
+    return metrics
+
+
+def _attach_ctx_metrics(detail, party_data, rating_data, detail_cfg):
+    rating_label = detail_cfg.get("rating_label", "meta1")
+    meta1 = detail.get(rating_label, "")
+    detail[_CTX_METRICS_KEY] = _normalize_ctx_metrics(party_data, rating_data, meta1)
+    return detail
+
+
+def _strip_internal_scrape_fields(items):
+    cleaned = []
+    for item in items:
+        if not isinstance(item, dict):
+            cleaned.append(item)
+            continue
+        cleaned.append(
+            {k: v for k, v in item.items() if k not in _INTERNAL_SCRAPE_KEYS},
+        )
+    return cleaned
+
+
+def _metrics_by_id(items):
+    out = {}
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
+        if item_id:
+            out[item_id] = dict(item.get(_CTX_METRICS_KEY) or {})
+    return out
+
+
+def _context_scoring_unavailable(metrics, profile):
+    if not metrics:
+        return True
+    if profile == "ratio_baseline":
+        good = metrics.get("good")
+        bad = metrics.get("bad")
+        if good is None and bad is None:
+            return True
+        return (int(good or 0) + int(bad or 0)) < 1
+    if metrics.get("rating") is None and metrics.get("order_total") is None:
+        if metrics.get("id_verify") is None and metrics.get("good") is None:
+            return True
+    return False
+
+
+def _party_score_rating_baseline(metrics, cfg):
+    total = 0
+    parts = []
+    min_orders = int(cfg.get("min_orders", 10))
+    min_reviews = int(cfg.get("min_reviews", 3))
+    baseline = float(cfg.get("baseline", 4.8))
+
+    rating = metrics.get("rating")
+    reviews = metrics.get("review_count")
+    orders = metrics.get("order_total")
+
+    rating_adj = 0
+    if (
+        rating is not None
+        and reviews is not None
+        and orders is not None
+        and orders >= min_orders
+        and reviews >= min_reviews
+    ):
+        delta = rating - baseline
+        if delta >= 0:
+            rating_adj = min(15, round(delta * delta * 200))
+        elif rating < 4.5 and reviews >= min_reviews:
+            rating_adj = max(-15, -round((4.5 - rating) ** 2 * 80))
+        total += rating_adj
+        if rating_adj:
+            parts.append(f"★{rating_adj:+d}")
+
+    if metrics.get("id_verify") == "済":
+        total += 2
+        parts.append("id+2")
+    if metrics.get("nda") == "済":
+        total += 2
+        parts.append("nda+2")
+    order_rate = metrics.get("order_rate_pct")
+    if order_rate is not None and order_rate >= 70:
+        total += 2
+        parts.append("orate+2")
+    completion = metrics.get("completion_rate_pct")
+    if completion is not None and completion >= 85:
+        total += 2
+        parts.append("comp+2")
+
+    if orders is not None and orders >= 10:
+        if completion is not None and completion < 40:
+            total -= 10
+            parts.append("comp-10")
+        if order_rate is not None and order_rate < 30:
+            total -= 5
+            parts.append("orate-5")
+
+    return total, "+".join(parts) if parts else "0"
+
+
+def _party_score_ratio_baseline(metrics, cfg):
+    total = 0
+    parts = []
+    min_feedback = int(cfg.get("min_feedback", 5))
+    baseline = float(cfg.get("ratio_baseline", 0.96))
+
+    good = int(metrics.get("good") or 0)
+    bad = int(metrics.get("bad") or 0)
+    feedback_total = good + bad
+    ratio_adj = 0
+    if feedback_total >= min_feedback:
+        ratio = good / feedback_total
+        delta = ratio - baseline
+        if delta >= 0:
+            ratio_adj = min(15, round(delta * delta * 3000))
+        elif ratio < 0.90:
+            ratio_adj = max(-15, -round((0.90 - ratio) ** 2 * 500))
+        total += ratio_adj
+        if ratio_adj:
+            parts.append(f"ratio{ratio_adj:+d}")
+
+    if metrics.get("id_verify") == "済":
+        total += 2
+        parts.append("id+2")
+    if metrics.get("nda") == "済":
+        total += 2
+        parts.append("nda+2")
+    order_rate = metrics.get("order_rate_pct")
+    if order_rate is not None and order_rate >= 50:
+        total += 2
+        parts.append("orate+2")
+    awarded = metrics.get("order_awarded")
+    if awarded is not None and awarded >= 10:
+        total += 2
+        parts.append("ord+2")
+        if order_rate is not None and order_rate < 20:
+            total -= 10
+            parts.append("orate-10")
+
+    return total, "+".join(parts) if parts else "0"
+
+
+def _compute_context_adjustment(metrics, scoring_cfg):
+    scoring_cfg = scoring_cfg or {}
+    profile = (scoring_cfg.get("profile") or "rating_baseline").strip()
+    if _context_scoring_unavailable(metrics, profile):
+        return 0, "不足"
+    if profile == "ratio_baseline":
+        total, breakdown = _party_score_ratio_baseline(metrics, scoring_cfg)
+    else:
+        total, breakdown = _party_score_rating_baseline(metrics, scoring_cfg)
+    clip = scoring_cfg.get("clip") or [-15, 20]
+    lo = int(clip[0]) if len(clip) > 0 else -15
+    hi = int(clip[1]) if len(clip) > 1 else 20
+    total = max(lo, min(hi, total))
+    return total, breakdown
+
+
+def _hard_fail_reason(reason):
+    markers = (
+        "絶対防壁", "スキル外", "新規一括", "新規システム", "機材なし",
+        "スキャナ", "自炊", "上限35", "上限25", "上限40",
+    )
+    text = str(reason or "")
+    return any(marker in text for marker in markers)
+
+
+def _recalc_pass_after_context(item, final_score, pass_threshold):
+    if _hard_fail_reason(item.get("reason")):
+        return False
+    return final_score >= pass_threshold
+
+
+def _append_context_adj_reason(item, base_score, final_score, adj, breakdown):
+    reason = str(item.get("reason") or "").strip()
+    adj_text = (
+        f"ctx_adj={adj}({breakdown})"
+        if adj
+        else "ctx_adj=0"
+    )
+    score_text = f"base={base_score}→final={final_score}"
+    suffix = f"{adj_text};{score_text}"
+    if not reason:
+        return suffix[:180]
+    combined = f"{reason};{suffix}"
+    return combined[:180]
+
+
+def _apply_context_scores(items, metrics_by_id, detail_cfg, pass_threshold, pass_field):
+    scoring_cfg = detail_cfg.get("context_scoring") or {}
+    if not scoring_cfg:
+        return items
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
+        metrics = metrics_by_id.get(item_id) or {}
+        base_score = item.get("safety_score", 0)
+        if not isinstance(base_score, (int, float)):
+            try:
+                base_score = int(base_score)
+            except (TypeError, ValueError):
+                base_score = 0
+        else:
+            base_score = int(base_score)
+        adj, breakdown = _compute_context_adjustment(metrics, scoring_cfg)
+        final_score = max(0, min(100, base_score + adj))
+        item["safety_score"] = final_score
+        item[pass_field] = _recalc_pass_after_context(item, final_score, pass_threshold)
+        item["reason"] = _append_context_adj_reason(
+            item, base_score, final_score, adj, breakdown,
+        )
+    return items
 
 
 def _merge_party_context(merge_cfg, dl_pairs, panel_data, party_data, rating_label):
@@ -1963,9 +2311,11 @@ def _scrape_detail_dom(page, detail, detail_cfg):
                     detail[src_field] = value
         panel_data = _extract_summary_panel(page, dom_desc_cfg.get("summary_panel"))
         party_data = _extract_party_panel(page, dom_desc_cfg.get("party_panel"))
+        rating_data = _extract_rating_panel(page, dom_desc_cfg.get("rating_panel"))
         detail = _apply_detail_context_merge(
             detail, dom_desc_cfg, dl_pairs, panel_data, party_data, rating_label,
         )
+        detail = _attach_ctx_metrics(detail, party_data, rating_data, detail_cfg)
     except Exception:
         if rating_label not in detail:
             detail[rating_label] = missing_context
@@ -1979,9 +2329,11 @@ def _enrich_detail_dom_context(page, detail, detail_cfg):
     rating_label = detail_cfg.get("rating_label", "meta1")
     panel_data = _extract_summary_panel(page, dom_desc_cfg.get("summary_panel"))
     party_data = _extract_party_panel(page, dom_desc_cfg.get("party_panel"))
-    return _apply_detail_context_merge(
+    rating_data = _extract_rating_panel(page, dom_desc_cfg.get("rating_panel"))
+    detail = _apply_detail_context_merge(
         detail, dom_desc_cfg, {}, panel_data, party_data, rating_label,
     )
+    return _attach_ctx_metrics(detail, party_data, rating_data, detail_cfg)
 
 
 def scrape_detail(page, items, detail_cfg):
@@ -2037,6 +2389,8 @@ def scrape_detail(page, items, detail_cfg):
                     detail = _scrape_detail_dom(page, detail, detail_cfg)
         except Exception:
             detail[rating_label] = "N/A"
+        if _CTX_METRICS_KEY not in detail:
+            detail[_CTX_METRICS_KEY] = {}
         results.append(detail)
     return results
 
@@ -2253,10 +2607,14 @@ def main():
             _log_progress(f"phase3 done detailed={len(detailed_items)}")
             current_phase = "phase4"
             _log_progress(f"phase4 start items={len(detailed_items)}")
+            ctx_metrics_by_id = _metrics_by_id(detailed_items)
             phase4_fields = [f.strip() for f in PHASE4_FIELDS.split(",") if f.strip()]
             raw = call_gemini(
                 KEYS_STR, MAX_API_USAGE, RESET_HOUR_UTC,
-                build_phase_prompt(AI_PROMPT, PROMPT_PHASE4, detailed_items),
+                build_phase_prompt(
+                    AI_PROMPT, PROMPT_PHASE4,
+                    _strip_internal_scrape_fields(detailed_items),
+                ),
                 GEMINI_MODEL,
             )
             last_gemini_raw = raw
@@ -2269,8 +2627,15 @@ def main():
                 source_items=detailed_items,
                 source_fields=("id", "title", "url", "meta1"),
             )
-            partial_result = result4
             result4_merged = merge_items_by_id(detailed_items, result4)
+            _apply_context_scores(
+                result4_merged,
+                ctx_metrics_by_id,
+                detail_cfg,
+                PASS_THRESHOLD,
+                PHASE4_PASS_FIELD,
+            )
+            partial_result = result4_merged
             passed4 = filter_passed(result4_merged, PHASE4_PASS_FIELD)
             _log_progress(f"phase4 done passed={len(passed4)}")
             if not passed4:
@@ -2288,7 +2653,7 @@ def main():
                         phase4_input=len(detailed_items),
                         phase4_passed=0,
                         pass_field=PHASE4_PASS_FIELD,
-                        partial_result=result4,
+                        partial_result=result4_merged,
                         seen_before=seen_ids_before,
                         seen_after=len(seen_ids),
                         seen_saved=seen_saved,
