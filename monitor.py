@@ -745,6 +745,48 @@ def _parse_gemini_json_array(text, phase_tag):
 
 _REASON_FIELD_ALIASES = ("rejection_reason", "screening_reason", "summary", "note")
 
+_SKILL_EXCLUDE_KEYWORDS = ("pythonの", "MQL4", "MT4")
+
+_PHASE7B_FIELD_ALIASES = {
+    "final_risk_score": "final_reception_score",
+    "reception_score": "final_reception_score",
+    "final_risk_findings": "final_credibility_bad",
+    "buyer_pain_point": "final_buyer_pain_point",
+    "credibility_good": "final_credibility_good",
+    "credibility_bad": "final_credibility_bad",
+}
+
+
+def _item_text_for_skill_exclude(item):
+    parts = [item.get("title"), item.get("description"), item.get("meta1")]
+    return " ".join(str(part) for part in parts if part)
+
+
+def _skill_exclude_keyword(item):
+    text = _item_text_for_skill_exclude(item)
+    if "pythonの" in text:
+        return "pythonの"
+    text_upper = text.upper()
+    for keyword in _SKILL_EXCLUDE_KEYWORDS[1:]:
+        if keyword in text_upper:
+            return keyword
+    return None
+
+
+def _partition_skill_excluded(items):
+    kept = []
+    excluded = []
+    for item in items:
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+        keyword = _skill_exclude_keyword(item)
+        if keyword:
+            excluded.append((item, keyword))
+        else:
+            kept.append(item)
+    return kept, excluded
+
 
 def _default_reason_text(item):
     for key in _REASON_FIELD_ALIASES:
@@ -762,10 +804,38 @@ def _default_reason_text(item):
     return "（理由未記載・自動補完）"
 
 
-def _normalize_gemini_item(item, required_fields):
+def _normalize_phase7b_item(item):
     if not isinstance(item, dict):
         return item
     normalized = dict(item)
+    for alias, canonical in _PHASE7B_FIELD_ALIASES.items():
+        if canonical not in normalized and alias in normalized:
+            normalized[canonical] = normalized[alias]
+    if "final_reception_score" not in normalized:
+        for key in ("final_risk_score", "reception_score", "score"):
+            if key in normalized:
+                normalized["final_reception_score"] = normalized[key]
+                break
+    if "final_buyer_pain_point" not in normalized:
+        normalized["final_buyer_pain_point"] = "（自動補完・発注者視点の課題は未記載）"
+    if "final_credibility_good" not in normalized:
+        normalized["final_credibility_good"] = "- 特になし"
+    if "final_credibility_bad" not in normalized:
+        for key in ("final_risk_findings", "credibility_bad"):
+            if key in normalized:
+                normalized["final_credibility_bad"] = normalized[key]
+                break
+        if "final_credibility_bad" not in normalized:
+            normalized["final_credibility_bad"] = "- 特になし"
+    return normalized
+
+
+def _normalize_gemini_item(item, required_fields, phase_tag=None):
+    if not isinstance(item, dict):
+        return item
+    normalized = dict(item)
+    if phase_tag == "phase7-b":
+        normalized = _normalize_phase7b_item(normalized)
     if "reason" in required_fields and "reason" not in normalized:
         normalized["reason"] = _default_reason_text(normalized)
     return normalized
@@ -810,7 +880,7 @@ def validate_json_list(
     for i, item in enumerate(data):
         if not isinstance(item, dict):
             raise ValueError(f"[{phase_tag}] Item [{i}] is not an object")
-        item = _normalize_gemini_item(item, required_fields)
+        item = _normalize_gemini_item(item, required_fields, phase_tag=phase_tag)
         data[i] = item
         for field in required_fields:
             if field not in item:
@@ -2594,6 +2664,37 @@ def main():
                 ) + "\n\n" + format_phase1_seed(phase1_diag, len(new_items)),
             )
 
+        skill_excluded_before_phase2 = []
+        new_items, skill_excluded_before_phase2 = _partition_skill_excluded(new_items)
+        if skill_excluded_before_phase2:
+            for item, keyword in skill_excluded_before_phase2:
+                seen_ids.add(item["id"])
+            _log_progress(
+                f"skill_exclude phase1 items={len(skill_excluded_before_phase2)}"
+                f" keywords={','.join(sorted({kw for _, kw in skill_excluded_before_phase2}))}",
+            )
+
+        if not new_items:
+            seen_saved = _maybe_save_seen_ids(seen_ids)
+            finish_run(
+                SLACK_WEBHOOK_URL,
+                NOTIFY_PHASE2_REJECTED_HEADER,
+                format_run_summary(
+                    "phase2_all_rejected",
+                    phase1_diag=phase1_diag,
+                    phase2_input=len(skill_excluded_before_phase2),
+                    phase2_passed=0,
+                    pass_field=PHASE2_PASS_FIELD,
+                    seen_before=seen_ids_before,
+                    seen_after=len(seen_ids),
+                    seen_saved=seen_saved,
+                    gemini_calls=gemini_calls,
+                    sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
+                    url_template=NOTIFY_URL_TEMPLATE,
+                    url_by_id=url_by_id,
+                ),
+            )
+
         if PROMPT_PHASE2:
             current_phase = "phase2"
             _log_progress(f"phase2 start items={len(new_items)}")
@@ -2652,6 +2753,39 @@ def main():
                     browser.close()
 
             _log_progress(f"phase3 done detailed={len(detailed_items)}")
+            skill_excluded_after_detail = []
+            detailed_items, skill_excluded_after_detail = _partition_skill_excluded(
+                detailed_items,
+            )
+            if skill_excluded_after_detail:
+                for item, keyword in skill_excluded_after_detail:
+                    seen_ids.add(item["id"])
+                _log_progress(
+                    f"skill_exclude phase3 items={len(skill_excluded_after_detail)}"
+                    f" keywords={','.join(sorted({kw for _, kw in skill_excluded_after_detail}))}",
+                )
+            if not detailed_items:
+                seen_saved = _maybe_save_seen_ids(seen_ids)
+                finish_run(
+                    SLACK_WEBHOOK_URL,
+                    NOTIFY_PHASE4_REJECTED_HEADER,
+                    format_run_summary(
+                        "phase4_all_rejected",
+                        phase1_diag=phase1_diag,
+                        phase2_input=len(new_items) + len(skill_excluded_before_phase2),
+                        phase2_passed=len(passed2),
+                        phase4_input=len(skill_excluded_after_detail),
+                        phase4_passed=0,
+                        pass_field=PHASE4_PASS_FIELD,
+                        seen_before=seen_ids_before,
+                        seen_after=len(seen_ids),
+                        seen_saved=seen_saved,
+                        gemini_calls=gemini_calls,
+                        sample_max=NOTIFY_SUMMARY_SAMPLE_MAX,
+                        url_template=NOTIFY_URL_TEMPLATE,
+                        url_by_id=url_by_id,
+                    ),
+                )
             current_phase = "phase4"
             _log_progress(f"phase4 start items={len(detailed_items)}")
             ctx_metrics_by_id = _metrics_by_id(detailed_items)
