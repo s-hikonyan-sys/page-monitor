@@ -745,7 +745,13 @@ def _parse_gemini_json_array(text, phase_tag):
 
 _REASON_FIELD_ALIASES = ("rejection_reason", "screening_reason", "summary", "note")
 
-_SKILL_EXCLUDE_KEYWORDS = ("pythonの", "MQL4", "MT4")
+_EXCLUDE_LITERAL_KEYWORDS = (
+    "pythonの",
+    "アフィリエイト",
+    "アフィリエート",
+    "楽天アフィ",
+)
+_EXCLUDE_ICASE_KEYWORDS = ("MQL4", "MT4")
 
 _PHASE7B_FIELD_ALIASES = {
     "final_risk_score": "final_reception_score",
@@ -764,10 +770,11 @@ def _item_text_for_skill_exclude(item):
 
 def _skill_exclude_keyword(item):
     text = _item_text_for_skill_exclude(item)
-    if "pythonの" in text:
-        return "pythonの"
+    for keyword in _EXCLUDE_LITERAL_KEYWORDS:
+        if keyword in text:
+            return keyword
     text_upper = text.upper()
-    for keyword in _SKILL_EXCLUDE_KEYWORDS[1:]:
+    for keyword in _EXCLUDE_ICASE_KEYWORDS:
         if keyword in text_upper:
             return keyword
     return None
@@ -1371,15 +1378,18 @@ def _compute_context_adjustment(metrics, scoring_cfg):
 
 def _hard_fail_reason(reason):
     markers = (
-        "絶対防壁", "スキル外", "新規一括", "新規システム", "機材なし",
+        "絶対防壁", "スキル外", "グレー", "アフィリエイト", "アフィリエート",
+        "新規一括", "新規システム", "機材なし",
         "スキャナ", "自炊", "上限35", "上限25", "上限40",
     )
     text = str(reason or "")
     return any(marker in text for marker in markers)
 
 
-def _recalc_pass_after_context(item, final_score, pass_threshold):
+def _recalc_pass_after_context(item, base_score, final_score, pass_threshold):
     if _hard_fail_reason(item.get("reason")):
+        return False
+    if base_score < pass_threshold:
         return False
     return final_score >= pass_threshold
 
@@ -1419,7 +1429,9 @@ def _apply_context_scores(items, metrics_by_id, detail_cfg, pass_threshold, pass
         adj, breakdown = _compute_context_adjustment(metrics, scoring_cfg)
         final_score = max(0, min(100, base_score + adj))
         item["safety_score"] = final_score
-        item[pass_field] = _recalc_pass_after_context(item, final_score, pass_threshold)
+        item[pass_field] = _recalc_pass_after_context(
+            item, base_score, final_score, pass_threshold,
+        )
         item["reason"] = _append_context_adj_reason(
             item, base_score, final_score, adj, breakdown,
         )
